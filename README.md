@@ -52,6 +52,8 @@ Reports are written to a `خروجی` ("output") folder next to the script:
 
 If a previous version's results are found in a sibling folder, the metrics sheet also includes delta columns comparing this run against that baseline.
 
+The summary file also contains portfolio sheets (`پرتفوی`, `پرتفوی_سالانه`, `پرتفوی_ماهانه`) that replay all trades chronologically through **one shared account** (1% risk of live equity per trade, global cap on simultaneous positions — see `PORTFOLIO_MAX_OPEN` / `PORTFOLIO_SYMBOLS`). The backtest window is configurable via `BACKTEST_START` / `BACKTEST_END` for out-of-sample testing.
+
 ## Requirements
 
 - Python 3.9+
