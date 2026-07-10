@@ -6,7 +6,9 @@ import numpy as np
 from analysis_distribution import distribution_sheets
 import pandas as pd
 
+# بازه‌ی بک‌تست: برای تست خارج از نمونه (مثلاً ۲۰۱۹ تا ۲۰۲۲) این دو خط را تغییر بده
 BACKTEST_START = pd.Timestamp("2023-01-01")
+BACKTEST_END = None  # نمونه: pd.Timestamp("2022-12-31")؛ None یعنی تا انتهای دیتا
 
 # هزینه‌های معاملاتی تقریبی (نسبت به اسپرد هر نماد؛ در صورت نیاز این دو عدد را ویرایش کن)
 COMMISSION_SPREAD_MULT = 0.5       # کمیسیون رفت‌وبرگشت ≈ نصف اسپرد
@@ -20,6 +22,10 @@ ENTRY_MODES = {
     "-75% داخل زون": -0.75,
 }
 DEFAULT_ENTRY_OFF = -0.50  # حالت اصلی که گزارش‌های کامل با آن ساخته می‌شود
+
+# --- بک‌تست پرتفویی: شبیه‌سازی یک حساب مشترک برای همه‌ی نمادها (شیت‌های «پرتفوی») ---
+PORTFOLIO_MAX_OPEN = 5   # حداکثر پوزیشن باز هم‌زمان در کل حساب
+PORTFOLIO_SYMBOLS = []   # خالی = همه‌ی نمادها؛ نمونه: ["AUDCAD","EURUSD","CHFJPY","XAUUSD","GBPCAD"]
 
 # (خروجی PDF/ژورنال در نسخه 1.9 تولید نمی‌شود)
 # این وابستگی‌ها اختیاری هستند؛ اگر نصب نبودند، بک‌تست همچنان اجرا می‌شود.
@@ -447,6 +453,12 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
     h4["atr"] = atr(h4)
     d1["atr"] = atr(d1)
     w1["atr"] = atr(w1)
+
+    # برش انتهای بازه‌ی بک‌تست (اگر BACKTEST_END تنظیم شده باشد)
+    if BACKTEST_END is not None:
+        h4 = h4[h4["time"] <= BACKTEST_END].copy()
+        d1 = d1[d1["time"] <= BACKTEST_END].copy()
+        w1 = w1[w1["time"] <= BACKTEST_END].copy()
 
     # کات اولیه از 2023 به بعد (برای منطق، نه ATR)
     h4_ = h4[h4["time"] >= bt_start].copy()
@@ -1049,6 +1061,94 @@ def augment_metrics_with_change_review(metrics_df: pd.DataFrame, current_dir: st
     return df_out, baseline_path
 
 # ---------------- Main ----------------
+def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_trade=0.01,
+                     max_open=None, symbols=None):
+    """شبیه‌سازی «یک حساب مشترک» روی معاملات همه‌ی نمادها:
+    معامله‌ها به ترتیب زمان ورود اجرا می‌شوند، ریسک هر معامله ۱٪ از اکویتی لحظه‌ای حساب است،
+    و اگر تعداد پوزیشن‌های باز به سقف برسد، معامله‌ی جدید گرفته نمی‌شود (رد می‌شود).
+    منطق استراتژی را تغییر نمی‌دهد؛ فقط حساب را واقعی می‌کند."""
+    import heapq
+
+    if trades_df is None or trades_df.empty:
+        return None
+    t = trades_df.copy()
+    if symbols:
+        t = t[t["نماد"].isin(list(symbols))]
+    if t.empty:
+        return None
+
+    t["زمان_ورود"] = pd.to_datetime(t["زمان_ورود"], errors="coerce")
+    t["زمان_خروج"] = pd.to_datetime(t["زمان_خروج"], errors="coerce")
+    t = t.dropna(subset=["زمان_ورود", "زمان_خروج", "نتیجه_R"]).sort_values("زمان_ورود")
+    if t.empty:
+        return None
+    if max_open is None:
+        max_open = PORTFOLIO_MAX_OPEN
+
+    eq = float(start_equity); peak = eq; max_dd = 0.0
+    open_heap = []   # (زمان_خروج, ردیف, مبلغ_ریسک, R)
+    curve = []
+    taken = skipped = 0
+    win_amt = loss_amt = 0.0
+    rs = []
+    seq = 0
+
+    def close_until(t_now):
+        nonlocal eq, peak, max_dd, win_amt, loss_amt
+        while open_heap and open_heap[0][0] <= t_now:
+            xt, _, ramt, r = heapq.heappop(open_heap)
+            pnl = ramt * r
+            eq += pnl
+            if pnl > 0: win_amt += pnl
+            else: loss_amt += -pnl
+            rs.append(r)
+            peak = max(peak, eq)
+            dd = (peak - eq) / peak if peak > 0 else 0.0
+            max_dd = max(max_dd, dd)
+            curve.append((xt, eq))
+
+    for entry_t, exit_t, r in zip(t["زمان_ورود"], t["زمان_خروج"], t["نتیجه_R"]):
+        close_until(entry_t)
+        if len(open_heap) >= max_open:
+            skipped += 1
+            continue
+        ramt = eq * (1.0 - reserve) * risk_per_trade
+        seq += 1
+        heapq.heappush(open_heap, (exit_t, seq, ramt, float(r)))
+        taken += 1
+    close_until(pd.Timestamp.max)
+
+    wins = sum(1 for r in rs if r > 0)
+    stats = pd.DataFrame([{
+        "تعداد_نماد": int(t["نماد"].nunique()),
+        "سقف_پوزیشن_همزمان": int(max_open),
+        "معاملات_انجام‌شده": int(taken),
+        "معاملات_ردشده_به_خاطر_سقف": int(skipped),
+        "درصد_برد": round(wins / len(rs) * 100.0, 2) if rs else 0.0,
+        "فاکتور_سود": round(win_amt / loss_amt, 3) if loss_amt > 0 else 999.0,
+        "بازده_خالص٪": round((eq - start_equity) / start_equity * 100.0, 2),
+        "حداکثر_افت٪": round(max_dd * 100.0, 2),
+        "اکویتی_نهایی": round(eq, 2),
+    }])
+
+    curve_df = pd.DataFrame(curve, columns=["زمان", "اکویتی"])
+
+    def _period_returns(fmt):
+        rows = []
+        prev = start_equity
+        c = curve_df.copy()
+        c["دوره"] = c["زمان"].dt.to_period(fmt).astype(str)
+        for per, g in c.groupby("دوره"):
+            e = float(g["اکویتی"].iloc[-1])
+            rows.append({"دوره": per, "بازده٪": round((e - prev) / prev * 100.0, 2),
+                         "اکویتی_پایان": round(e, 2)})
+            prev = e
+        return pd.DataFrame(rows)
+
+    return {"stats": stats,
+            "yearly": _period_returns("Y").rename(columns={"دوره": "سال"}),
+            "monthly": _period_returns("M").rename(columns={"دوره": "ماه"})}
+
 def main():
     version_name = os.path.basename(os.getcwd())
     outdir = os.path.join(os.getcwd(), "خروجی")
@@ -1142,7 +1242,8 @@ def main():
 
     # مدت واقعی بک‌تست: از شروع 2023 تا انتهای دیتای موجود
     if max_data_time is not None:
-        years = max((max_data_time - BACKTEST_START).days / 365.25, 1.0 / 12.0)
+        end_t = max_data_time if BACKTEST_END is None else min(max_data_time, BACKTEST_END)
+        years = max((end_t - BACKTEST_START).days / 365.25, 1.0 / 12.0)
     else:
         years = 1.0 / 12.0
 
@@ -1332,10 +1433,21 @@ def main():
             cmp_out = cmp_out[[c for c in cmp_cols if c in cmp_out.columns]]
             cmp_out = cmp_out.sort_values(["حالت_ورود","نماد"]).reset_index(drop=True)
 
+        # --- شبیه‌سازی حساب مشترک (پرتفوی) ---
+        port = None
+        try:
+            port = portfolio_replay(trades_df, symbols=(PORTFOLIO_SYMBOLS or None))
+        except Exception as e:
+            print("⚠️ شبیه‌سازی پرتفوی ناموفق بود:", str(e))
+
         with pd.ExcelWriter(summary_path, engine="openpyxl") as sw:
             summary_out.to_excel(sw, sheet_name="خلاصه", index=False)
             if cmp_out is not None:
                 cmp_out.to_excel(sw, sheet_name="مقایسه_نقطه_ورود", index=False)
+            if port is not None:
+                port["stats"].to_excel(sw, sheet_name="پرتفوی", index=False)
+                port["yearly"].to_excel(sw, sheet_name="پرتفوی_سالانه", index=False)
+                port["monthly"].to_excel(sw, sheet_name="پرتفوی_ماهانه", index=False)
 
         # --- خروجی نهایی (جزئیات کامل) ---
         with pd.ExcelWriter(detailed_path, engine="openpyxl") as writer:
