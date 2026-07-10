@@ -21,7 +21,7 @@ Key parameters (see `backtest_one` in `run_backtest.py`):
 | Risk per trade | 1% of usable equity |
 | Reserve capital | 15% |
 | Reward:risk | 3.0 |
-| Entry offset | 10% of zone height beyond the proximal line, toward price (compensates for spread) |
+| Entry offset | default 10% of zone height inside the zone (past the proximal line); the summary report also compares −10%/−25%/−50% entries side by side |
 | Stop-loss offset | 25% of zone height beyond the distal line, away from price |
 | Max simultaneous orders | 3 |
 | Costs | commission ≈ 0.5×spread (round-trip) + swap ≈ 0.2×spread per night held; per-symbol spreads defined in `main()` |
