@@ -12,6 +12,16 @@ BACKTEST_START = pd.Timestamp("2023-01-01")
 COMMISSION_SPREAD_MULT = 0.5       # کمیسیون رفت‌وبرگشت ≈ نصف اسپرد
 SWAP_SPREAD_MULT_PER_NIGHT = 0.2   # سواپ ≈ ۲۰٪ اسپرد به ازای هر شب نگهداری پوزیشن
 
+# مقایسه‌ی حالت‌های نقطه‌ی ورود در یک اجرا (شیت «مقایسه_نقطه_ورود» در خلاصه_نتایج.xlsx)
+# اگر نمی‌خواهی و اجرا سریع‌تر شود، این را False کن.
+COMPARE_ENTRY_MODES = True
+ENTRY_MODES = {
+    "+10% نزدیک قیمت (بیرون زون)": 0.10,
+    "0% روی پراکسیمال": 0.0,
+    "-10% داخل زون (دور از قیمت)": -0.10,
+}
+DEFAULT_ENTRY_OFF = 0.10  # حالت اصلی که گزارش‌های کامل با آن ساخته می‌شود
+
 # (خروجی PDF/ژورنال در نسخه 1.9 تولید نمی‌شود)
 # این وابستگی‌ها اختیاری هستند؛ اگر نصب نبودند، بک‌تست همچنان اجرا می‌شود.
 canvas = None
@@ -512,8 +522,9 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
     def make_order(z:Zone, t_now, test_no):
         height = z.high()-z.low()
         if height<=0: height=1e-9
-        # ورود = پراکسیمال + ۱۰٪ ارتفاع بیس به سمت قیمت (بیرون زون) تا به‌خاطر اسپرد جا نمانیم.
-        # همین فاصله جبران اسپرد است؛ اسپرد جداگانه دوباره حساب نمی‌شود.
+        # ورود = پراکسیمال + entry_off × ارتفاع بیس، به سمت قیمت.
+        # entry_off مثبت = بیرون زون نزدیک قیمت (جبران اسپرد)، منفی = داخل زون دورتر از قیمت.
+        # اسپرد جداگانه دوباره حساب نمی‌شود.
         if z.direction=="BUY":
             entry = z.proximal + entry_off*height
             sl    = z.distal  - sl_off*height
@@ -1090,6 +1101,7 @@ def main():
     all_zones=[]
     all_events=[]
     all_zone_reasons=[]
+    entry_mode_rows=[]
     max_data_time = None
     for zp in zip_files:
         base=os.path.basename(zp)
@@ -1100,7 +1112,19 @@ def main():
             if pd.notna(end_t):
                 max_data_time = end_t if max_data_time is None else max(max_data_time, end_t)
 
-        mdf, rdf, tdf, zdf, edf, zreason = backtest_one(symbol, h4,d1,w1, years, spreads.get(symbol, 0.0))
+        mdf, rdf, tdf, zdf, edf, zreason = backtest_one(symbol, h4,d1,w1, years, spreads.get(symbol, 0.0),
+                                                        entry_off=DEFAULT_ENTRY_OFF)
+
+        # اجرای حالت‌های دیگر نقطه‌ی ورود فقط برای مقایسه (بقیه‌ی گزارش‌ها با حالت اصلی است)
+        if COMPARE_ENTRY_MODES:
+            for mode_name, eoff in ENTRY_MODES.items():
+                if abs(eoff - DEFAULT_ENTRY_OFF) < 1e-12:
+                    m_mode = mdf.copy()
+                else:
+                    m_mode = backtest_one(symbol, h4, d1, w1, years, spreads.get(symbol, 0.0),
+                                          entry_off=eoff)[0].copy()
+                m_mode["حالت_ورود"] = mode_name
+                entry_mode_rows.append(m_mode)
 
         all_metrics.append(mdf)
         all_reasons.append(rdf)
@@ -1286,7 +1310,33 @@ def main():
             if c not in summary_df.columns:
                 summary_df[c] = np.nan
         summary_out = summary_df[summary_cols].copy()
-        summary_out.to_excel(summary_path, index=False)
+
+        # --- شیت مقایسه‌ی حالت‌های نقطه‌ی ورود ---
+        cmp_out = None
+        if COMPARE_ENTRY_MODES and entry_mode_rows:
+            cmp_df = pd.concat(entry_mode_rows, ignore_index=True)
+            agg_rows=[]
+            for mode, g in cmp_df.groupby("حالت_ورود", sort=False):
+                n = float(g["تعداد"].sum())
+                w = g["تعداد"].astype(float)
+                wr = float((g["درصد_برد"]*w).sum()/n) if n>0 else 0.0
+                ar = float((g["میانگین_R"]*w).sum()/n) if n>0 else 0.0
+                agg_rows.append({
+                    "حالت_ورود": mode, "نماد": "کل", "تعداد": int(n),
+                    "درصد_برد": round(wr,2), "میانگین_R": round(ar,3),
+                    "بازده_خالص٪": round(float(g["بازده_خالص٪"].mean()),2),
+                    "حداکثر_افت٪": round(float(g["حداکثر_افت٪"].max()),2),
+                    "فاکتور_سود": round(float(g["فاکتور_سود"].mean()),3),
+                })
+            cmp_out = pd.concat([cmp_df, pd.DataFrame(agg_rows)], ignore_index=True)
+            cmp_cols=["حالت_ورود","نماد","تعداد","درصد_برد","میانگین_R","بازده_خالص٪","حداکثر_افت٪","فاکتور_سود"]
+            cmp_out = cmp_out[[c for c in cmp_cols if c in cmp_out.columns]]
+            cmp_out = cmp_out.sort_values(["حالت_ورود","نماد"]).reset_index(drop=True)
+
+        with pd.ExcelWriter(summary_path, engine="openpyxl") as sw:
+            summary_out.to_excel(sw, sheet_name="خلاصه", index=False)
+            if cmp_out is not None:
+                cmp_out.to_excel(sw, sheet_name="مقایسه_نقطه_ورود", index=False)
 
         # --- خروجی نهایی (جزئیات کامل) ---
         with pd.ExcelWriter(detailed_path, engine="openpyxl") as writer:
