@@ -21,10 +21,12 @@ Key parameters (see `backtest_one` in `run_backtest.py`):
 | Risk per trade | 1% of usable equity |
 | Reserve capital | 15% |
 | Reward:risk | 3.0 |
-| Entry offset | 10% of zone height |
-| Stop-loss offset | 25% of zone height |
+| Entry offset | 10% of zone height beyond the proximal line, toward price (compensates for spread) |
+| Stop-loss offset | 25% of zone height beyond the distal line, away from price |
 | Max simultaneous orders | 3 |
-| Spread | per-symbol estimates defined in `main()` |
+| Costs | commission ≈ 0.5×spread (round-trip) + swap ≈ 0.2×spread per night held; per-symbol spreads defined in `main()` |
+
+The backtest avoids look-ahead bias: trend/range filters and the weekly-cancel check use only closed candles, zones activate after their confirmation candle closes, and overlapping-zone dedup is point-in-time (a newer zone replaces older ones only from its own creation time).
 
 ## Files
 
