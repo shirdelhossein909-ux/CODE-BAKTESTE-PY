@@ -8,6 +8,20 @@ import pandas as pd
 
 BACKTEST_START = pd.Timestamp("2023-01-01")
 
+# هزینه‌های معاملاتی تقریبی (نسبت به اسپرد هر نماد؛ در صورت نیاز این دو عدد را ویرایش کن)
+COMMISSION_SPREAD_MULT = 0.5       # کمیسیون رفت‌وبرگشت ≈ نصف اسپرد
+SWAP_SPREAD_MULT_PER_NIGHT = 0.2   # سواپ ≈ ۲۰٪ اسپرد به ازای هر شب نگهداری پوزیشن
+
+# مقایسه‌ی حالت‌های نقطه‌ی ورود در یک اجرا (شیت «مقایسه_نقطه_ورود» در خلاصه_نتایج.xlsx)
+# اگر نمی‌خواهی و اجرا سریع‌تر شود، این را False کن.
+COMPARE_ENTRY_MODES = True
+ENTRY_MODES = {
+    "+10% نزدیک قیمت (بیرون زون)": 0.10,
+    "0% روی پراکسیمال": 0.0,
+    "-10% داخل زون (دور از قیمت)": -0.10,
+}
+DEFAULT_ENTRY_OFF = 0.10  # حالت اصلی که گزارش‌های کامل با آن ساخته می‌شود
+
 # (خروجی PDF/ژورنال در نسخه 1.9 تولید نمی‌شود)
 # این وابستگی‌ها اختیاری هستند؛ اگر نصب نبودند، بک‌تست همچنان اجرا می‌شود.
 canvas = None
@@ -257,6 +271,7 @@ class Zone:
         self.clean_after_touch=999
         self.expired=False
         self.zone_id=None
+        self.superseded_time=None  # زمانی که زون جدیدِ هم‌پوشان جای این زون را می‌گیرد
 
     def low(self): return min(self.proximal, self.distal)
     def high(self): return max(self.proximal, self.distal)
@@ -344,6 +359,26 @@ def dedup_zones(zones, thr=0.55):
                 rep.proximal=low; rep.distal=high
         out.append(rep)
     return out
+
+def dedup_zones_pit(zones, thr=0.55):
+    """حذف زون‌های هم‌پوشان بدون نگاه به آینده:
+    هر زون جدید، زون‌های هم‌پوشانِ قبلی را فقط از «زمان ایجاد خودش» به بعد جایگزین می‌کند
+    و محدوده‌اش با زون‌های قبلی (که در آن لحظه معلوم‌اند) تنگ‌تر می‌شود."""
+    zones = sorted(zones, key=lambda z: z.created_time)
+    active = []
+    for z in zones:
+        for old in active:
+            if overlap_ratio(z.low(), z.high(), old.low(), old.high()) >= thr:
+                old.superseded_time = z.created_time
+                low = max(z.low(), old.low()); high = min(z.high(), old.high())
+                if low < high:
+                    if z.direction == "BUY":
+                        z.proximal = high; z.distal = low
+                    else:
+                        z.proximal = low; z.distal = high
+        active = [a for a in active if a.superseded_time is None]
+        active.append(z)
+    return zones
 
 def body_overlaps_zone(o,c,z:Zone):
     bl=min(o,c); bh=max(o,c)
@@ -448,8 +483,8 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
     h4["trend"] = trend_from_swings(h4, n=1)  # همین حالا بدون lookahead شده چون trend_from_swings را عوض کردی
     d1["trend"] = trend_from_swings(d1, n=1)
 
-    w_z = dedup_zones(build_zones(w1, symbol, "W1", 12, w1["atr"]))
-    h_z = dedup_zones(build_zones(h4, symbol, "H4", 6,  h4["atr"]))
+    w_z = dedup_zones_pit(build_zones(w1, symbol, "W1", 12, w1["atr"]))
+    h_z = dedup_zones_pit(build_zones(h4, symbol, "H4", 6,  h4["atr"]))
 
     # ZoneID
     h_z = sorted(h_z, key=lambda z: z.created_time)
@@ -476,22 +511,30 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
         "لغو_به_خاطر_هفتگی": 0,
         "لغو_به_خاطر_تست_سوم": 0,
         "انقضا_زون": 0,
+        "جایگزینی_زون": 0,
         "ورود_انجام_شد": 0,
     }
+
+    # هزینه‌های تقریبی این نماد (برحسب قیمت)
+    commission_cost = COMMISSION_SPREAD_MULT * float(spread)
+    swap_per_night = SWAP_SPREAD_MULT_PER_NIGHT * float(spread)
 
     def make_order(z:Zone, t_now, test_no):
         height = z.high()-z.low()
         if height<=0: height=1e-9
+        # ورود = پراکسیمال + entry_off × ارتفاع بیس، به سمت قیمت.
+        # entry_off مثبت = بیرون زون نزدیک قیمت (جبران اسپرد)، منفی = داخل زون دورتر از قیمت.
+        # اسپرد جداگانه دوباره حساب نمی‌شود.
         if z.direction=="BUY":
-            entry = z.proximal - entry_off*height
+            entry = z.proximal + entry_off*height
             sl    = z.distal  - sl_off*height
-            eff_entry = entry + spread
+            eff_entry = entry
             risk = eff_entry - sl
             tp = eff_entry + rr*risk
         else:
-            entry = z.proximal + entry_off*height
+            entry = z.proximal - entry_off*height
             sl    = z.distal  + sl_off*height
-            eff_entry = entry - spread
+            eff_entry = entry
             risk = sl - eff_entry
             tp = eff_entry - rr*risk
 
@@ -528,6 +571,13 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
 
         result_r = (exit_price - eff_entry)/risk if direction=="BUY" else (eff_entry - exit_price)/risk
 
+        # کسر هزینه‌های تقریبی: کمیسیون + سواپ به ازای هر شب نگهداری
+        try:
+            nights = max(0, int((pd.Timestamp(exit_time).normalize() - pd.Timestamp(pos["fill_time"]).normalize()).days))
+        except Exception:
+            nights = 0
+        result_r = float(result_r) - (commission_cost + swap_per_night * nights) / risk
+
         equity += pos["risk_amt"] * float(result_r)
         peak=max(peak,equity)
         dd=(peak-equity)/peak if peak>0 else 0.0
@@ -559,14 +609,19 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
         l=float(h4["low"].iloc[i]);  c=float(h4["close"].iloc[i])
 
         di=last_idx_leq(d_times, t.to_datetime64())
-        if di<0: 
+        if di<1 or i<1:
             continue
 
-        dtr=int(d1["trend"].iloc[di])
-        htr=int(h4["trend"].iloc[i])
+        # فیلترها فقط از کندل‌های «بسته‌شده» خوانده می‌شوند (بدون نگاه به آینده):
+        # کندل H4 قبلی و آخرین کندل روزانه‌ی کامل‌شده (di-1)
+        dtr=int(d1["trend"].iloc[di-1])
+        htr=int(h4["trend"].iloc[i-1])
 
-        drg=bool(d1["range"].iloc[di]) if not pd.isna(d1["range"].iloc[di]) else False
-        hrg=bool(h4["range"].iloc[i])  if not pd.isna(h4["range"].iloc[i])  else False
+        drg=bool(d1["range"].iloc[di-1]) if not pd.isna(d1["range"].iloc[di-1]) else False
+        hrg=bool(h4["range"].iloc[i-1])  if not pd.isna(h4["range"].iloc[i-1])  else False
+
+        # بدنه‌ی کندل بسته‌شده‌ی قبلی برای چک لغو هفتگی
+        o_prev=float(h4["open"].iloc[i-1]); c_prev=float(h4["close"].iloc[i-1])
 
         # ---------- exits for already-open positions ----------
         still_open=[]
@@ -580,7 +635,16 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
 
         # ---------- touches + expiry (همان) ----------
         for z in h_z:
-            if z.created_time>t or z.expired:
+            # زون از کندلِ بعد از تأییدش فعال می‌شود (کندل تأیید باید اول بسته شود)
+            if z.created_time>=t or z.expired:
+                continue
+
+            # اگر زون جدیدِ هم‌پوشان آمده باشد، این زون از همان لحظه کنار می‌رود
+            if z.superseded_time is not None and t >= z.superseded_time:
+                z.expired=True
+                reasons["جایگزینی_زون"] += 1
+                set_final(zone_df, z.zone_id, "منقضی شد", "زون جدید هم‌پوشان جایگزین شد", t)
+                log_event(events, t, symbol, z.zone_id, "Superseded", "")
                 continue
 
             touched = (h >= z.low() and l <= z.high())
@@ -609,7 +673,7 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
 
         # ---------- place orders (همان) ----------
         for z in h_z:
-            if z.created_time>t or z.expired or id(z) in used:
+            if z.created_time>=t or z.expired or id(z) in used:
                 continue
             if z.touch_count>=3:
                 reasons["لغو_به_خاطر_تست_سوم"] += 1
@@ -644,13 +708,16 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
             used.add(id(z))
 
         # ---------- weekly cancel BEFORE fill (همان) ----------
-        wz_now=[wz for wz in w_z if wz.created_time<=t]
+        # زون هفتگی فقط بعد از بسته‌شدن کندل هفتگیِ تأیید (حدود ۷ روز بعد) معتبر است
+        wz_now=[wz for wz in w_z
+                if wz.created_time + pd.Timedelta(days=7) <= t
+                and (wz.superseded_time is None or t < wz.superseded_time)]
         for p in pending:
             if not p["active"] or p["filled"]:
                 continue
             opp_dir = "SELL" if p["z"].direction=="BUY" else "BUY"
             opp=[wz for wz in wz_now if wz.direction==opp_dir]
-            if any(body_overlaps_zone(o,c,wz) for wz in opp):
+            if any(body_overlaps_zone(o_prev,c_prev,wz) for wz in opp):
                 p["active"]=False
                 p["cancel"]="لغو: برخورد بدنه با زون مخالف هفتگی"
                 reasons["لغو_به_خاطر_هفتگی"] += 1
@@ -1034,6 +1101,7 @@ def main():
     all_zones=[]
     all_events=[]
     all_zone_reasons=[]
+    entry_mode_rows=[]
     max_data_time = None
     for zp in zip_files:
         base=os.path.basename(zp)
@@ -1044,7 +1112,19 @@ def main():
             if pd.notna(end_t):
                 max_data_time = end_t if max_data_time is None else max(max_data_time, end_t)
 
-        mdf, rdf, tdf, zdf, edf, zreason = backtest_one(symbol, h4,d1,w1, years, spreads.get(symbol, 0.0))
+        mdf, rdf, tdf, zdf, edf, zreason = backtest_one(symbol, h4,d1,w1, years, spreads.get(symbol, 0.0),
+                                                        entry_off=DEFAULT_ENTRY_OFF)
+
+        # اجرای حالت‌های دیگر نقطه‌ی ورود فقط برای مقایسه (بقیه‌ی گزارش‌ها با حالت اصلی است)
+        if COMPARE_ENTRY_MODES:
+            for mode_name, eoff in ENTRY_MODES.items():
+                if abs(eoff - DEFAULT_ENTRY_OFF) < 1e-12:
+                    m_mode = mdf.copy()
+                else:
+                    m_mode = backtest_one(symbol, h4, d1, w1, years, spreads.get(symbol, 0.0),
+                                          entry_off=eoff)[0].copy()
+                m_mode["حالت_ورود"] = mode_name
+                entry_mode_rows.append(m_mode)
 
         all_metrics.append(mdf)
         all_reasons.append(rdf)
@@ -1230,7 +1310,33 @@ def main():
             if c not in summary_df.columns:
                 summary_df[c] = np.nan
         summary_out = summary_df[summary_cols].copy()
-        summary_out.to_excel(summary_path, index=False)
+
+        # --- شیت مقایسه‌ی حالت‌های نقطه‌ی ورود ---
+        cmp_out = None
+        if COMPARE_ENTRY_MODES and entry_mode_rows:
+            cmp_df = pd.concat(entry_mode_rows, ignore_index=True)
+            agg_rows=[]
+            for mode, g in cmp_df.groupby("حالت_ورود", sort=False):
+                n = float(g["تعداد"].sum())
+                w = g["تعداد"].astype(float)
+                wr = float((g["درصد_برد"]*w).sum()/n) if n>0 else 0.0
+                ar = float((g["میانگین_R"]*w).sum()/n) if n>0 else 0.0
+                agg_rows.append({
+                    "حالت_ورود": mode, "نماد": "کل", "تعداد": int(n),
+                    "درصد_برد": round(wr,2), "میانگین_R": round(ar,3),
+                    "بازده_خالص٪": round(float(g["بازده_خالص٪"].mean()),2),
+                    "حداکثر_افت٪": round(float(g["حداکثر_افت٪"].max()),2),
+                    "فاکتور_سود": round(float(g["فاکتور_سود"].mean()),3),
+                })
+            cmp_out = pd.concat([cmp_df, pd.DataFrame(agg_rows)], ignore_index=True)
+            cmp_cols=["حالت_ورود","نماد","تعداد","درصد_برد","میانگین_R","بازده_خالص٪","حداکثر_افت٪","فاکتور_سود"]
+            cmp_out = cmp_out[[c for c in cmp_cols if c in cmp_out.columns]]
+            cmp_out = cmp_out.sort_values(["حالت_ورود","نماد"]).reset_index(drop=True)
+
+        with pd.ExcelWriter(summary_path, engine="openpyxl") as sw:
+            summary_out.to_excel(sw, sheet_name="خلاصه", index=False)
+            if cmp_out is not None:
+                cmp_out.to_excel(sw, sheet_name="مقایسه_نقطه_ورود", index=False)
 
         # --- خروجی نهایی (جزئیات کامل) ---
         with pd.ExcelWriter(detailed_path, engine="openpyxl") as writer:
