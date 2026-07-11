@@ -27,15 +27,23 @@ ENTRY_MODES = {
 }
 DEFAULT_ENTRY_OFF = -0.50  # حالت اصلی که گزارش‌های کامل با آن ساخته می‌شود
 
-# مقایسه‌ی نسبت سود به ضرر (RR) در یک اجرا — نتایج در شیت «مقایسه_RR»
-COMPARE_RR_MODES = True
+# مقایسه‌ی نسبت سود به ضرر (RR) — تمام شد؛ RR نهایی: 3
+COMPARE_RR_MODES = False
 RR_MODES = {
     "RR=3": 3.0,
-    "RR=4": 4.0,
-    "RR=5": 5.0,
-    "RR=6": 6.0,
 }
 DEFAULT_RR = 3.0  # حالت اصلی گزارش‌های کامل
+
+# فیلتر «حداقل اندازه‌ی زون»: اگر فاصله‌ی ورود تا استاپ کمتر از این ضریب از ATR باشد، معامله نمی‌شود.
+# چند آستانه در یک اجرا مقایسه می‌شود — شیت «مقایسه_حداقل_زون»
+COMPARE_MINRISK_MODES = True
+MINRISK_MODES = {
+    "بدون فیلتر": 0.0,
+    "ملایم 0.5xATR": 0.5,
+    "متوسط 0.75xATR": 0.75,
+    "سختگیر 1.0xATR": 1.0,
+}
+DEFAULT_MIN_RISK_ATR = 0.0  # حالت اصلی گزارش‌های کامل (فعلاً بدون فیلتر تا مقایسه را ببینیم)
 
 # --- بک‌تست پرتفویی: شبیه‌سازی یک حساب مشترک برای همه‌ی نمادها (شیت‌های «پرتفوی») ---
 PORTFOLIO_MAX_OPEN = 5              # حداکثر پوزیشن باز هم‌زمان در کل حساب
@@ -513,7 +521,7 @@ def log_event(events, t, symbol, zid, etype, detail=""):
 def backtest_one(symbol, h4, d1, w1, years, spread,
                  entry_off=0.10, sl_off=0.25, rr=3.0,
                  reserve=0.15, risk_per_trade=0.01, max_orders=3,
-                 m15=None):
+                 m15=None, min_risk_atr=0.0):
 
     bt_start = BACKTEST_START
 
@@ -595,6 +603,7 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
         "زون_چهارساعته_کل": len(h_z),
         "رد_به_خاطر_رنج": 0,
         "رد_به_خاطر_روند": 0,
+        "رد_به_خاطر_زون_کوچک": 0,
         "رد_به_خاطر_سقف_سفارش": 0,
         "لغو_به_خاطر_هفتگی": 0,
         "لغو_به_خاطر_تست_سوم": 0,
@@ -878,6 +887,18 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
                 set_final(zone_df, z.zone_id, "رد شد", "سقف سفارش هم‌زمان", t)
                 log_event(events, t, symbol, z.zone_id, "Rejected", "سقف سفارش")
                 used.add(id(z)); continue
+
+            # فیلتر حداقل اندازه‌ی زون: فاصله‌ی ورود تا استاپ باید حداقل min_risk_atr برابر ATR باشد
+            # (ATR از کندل قبلیِ بسته‌شده — بدون نگاه به آینده)
+            if min_risk_atr > 0:
+                atr_ref = h4["atr"].iloc[i-1]
+                height = z.high() - z.low()
+                risk_est = height * (1.0 + entry_off + sl_off)
+                if pd.isna(atr_ref) or risk_est < min_risk_atr * float(atr_ref):
+                    reasons["رد_به_خاطر_زون_کوچک"] += 1
+                    set_final(zone_df, z.zone_id, "رد شد", "زون خیلی کوچک (استاپ نزدیک)", t)
+                    log_event(events, t, symbol, z.zone_id, "Rejected", "SmallZone")
+                    used.add(id(z)); continue
 
             test_no = 1 if z.touch_count==1 else 2
             pending.append(make_order(z, t, test_no))
@@ -1449,6 +1470,7 @@ def main():
     all_zone_reasons=[]
     entry_mode_rows=[]
     rr_mode_rows=[]
+    minrisk_mode_rows=[]
     max_data_time = None
     for zp in zip_files:
         base=os.path.basename(zp)
@@ -1462,7 +1484,8 @@ def main():
                 max_data_time = end_t if max_data_time is None else max(max_data_time, end_t)
 
         mdf, rdf, tdf, zdf, edf, zreason = backtest_one(symbol, h4,d1,w1, years, spreads.get(symbol, 0.0),
-                                                        entry_off=DEFAULT_ENTRY_OFF, rr=DEFAULT_RR, m15=m15)
+                                                        entry_off=DEFAULT_ENTRY_OFF, rr=DEFAULT_RR, m15=m15,
+                                                        min_risk_atr=DEFAULT_MIN_RISK_ATR)
 
         # اجرای RR های دیگر فقط برای مقایسه (گزارش‌های کامل با DEFAULT_RR است)
         if COMPARE_RR_MODES:
@@ -1474,6 +1497,18 @@ def main():
                                         entry_off=DEFAULT_ENTRY_OFF, rr=rrv, m15=m15)[0].copy()
                 m_rr["حالت_RR"] = mode_name
                 rr_mode_rows.append(m_rr)
+
+        # مقایسه‌ی آستانه‌های فیلتر «حداقل اندازه‌ی زون»
+        if COMPARE_MINRISK_MODES:
+            for mode_name, mra in MINRISK_MODES.items():
+                if abs(mra - DEFAULT_MIN_RISK_ATR) < 1e-12:
+                    m_mr = mdf.copy()
+                else:
+                    m_mr = backtest_one(symbol, h4, d1, w1, years, spreads.get(symbol, 0.0),
+                                        entry_off=DEFAULT_ENTRY_OFF, rr=DEFAULT_RR, m15=m15,
+                                        min_risk_atr=mra)[0].copy()
+                m_mr["حداقل_زون"] = mode_name
+                minrisk_mode_rows.append(m_mr)
 
         # اجرای حالت‌های دیگر نقطه‌ی ورود فقط برای مقایسه (بقیه‌ی گزارش‌ها با حالت اصلی است)
         if COMPARE_ENTRY_MODES:
@@ -1678,6 +1713,7 @@ def main():
         # --- شیت‌های مقایسه (نقطه‌ی ورود / RR) ---
         cmp_out = _aggregate_mode_rows(entry_mode_rows, "حالت_ورود") if (COMPARE_ENTRY_MODES and entry_mode_rows) else None
         rr_out = _aggregate_mode_rows(rr_mode_rows, "حالت_RR") if (COMPARE_RR_MODES and rr_mode_rows) else None
+        mr_out = _aggregate_mode_rows(minrisk_mode_rows, "حداقل_زون") if (COMPARE_MINRISK_MODES and minrisk_mode_rows) else None
 
         # --- شبیه‌سازی حساب مشترک (پرتفوی) ---
         port = None
@@ -1692,6 +1728,8 @@ def main():
                 cmp_out.to_excel(sw, sheet_name="مقایسه_نقطه_ورود", index=False)
             if rr_out is not None:
                 rr_out.to_excel(sw, sheet_name="مقایسه_RR", index=False)
+            if mr_out is not None:
+                mr_out.to_excel(sw, sheet_name="مقایسه_حداقل_زون", index=False)
             if port is not None:
                 port["stats"].to_excel(sw, sheet_name="پرتفوی", index=False)
                 port["yearly"].to_excel(sw, sheet_name="پرتفوی_سالانه", index=False)
