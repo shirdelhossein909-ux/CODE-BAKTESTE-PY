@@ -40,6 +40,7 @@ The script expects one ZIP file per symbol in `%USERPROFILE%\Desktop\0` (e.g. `U
 - `*-240.csv` — H4
 - `*-1D.csv` — daily
 - `*-1W.csv` — weekly
+- `*-15.csv` — M15 (optional but recommended): used to resolve intra-candle ambiguity — when SL and TP are both touched within one H4 candle, and on the entry candle (fill moment first, then only post-fill highs/lows count). Without M15 the engine falls back to the pessimistic rule (SL wins) and reports how many cases lacked M15.
 
 Change the `datadir` path in `main()` if your data lives elsewhere.
 
