@@ -25,6 +25,15 @@ ENTRY_MODES = {
 }
 DEFAULT_ENTRY_OFF = -0.50  # حالت اصلی که گزارش‌های کامل با آن ساخته می‌شود
 
+# مقایسه‌ی نسبت سود به ضرر (RR) در یک اجرا — نتایج در شیت «مقایسه_RR»
+COMPARE_RR_MODES = True
+RR_MODES = {
+    "RR=3.0": 3.0,
+    "RR=2.5": 2.5,
+    "RR=2.0": 2.0,
+}
+DEFAULT_RR = 3.0  # حالت اصلی گزارش‌های کامل
+
 # --- بک‌تست پرتفویی: شبیه‌سازی یک حساب مشترک برای همه‌ی نمادها (شیت‌های «پرتفوی») ---
 PORTFOLIO_MAX_OPEN = 5              # حداکثر پوزیشن باز هم‌زمان در کل حساب
 PORTFOLIO_RISK_PER_TRADE = 0.005    # ریسک هر معامله از اکویتی حساب (0.005 = نیم درصد، 0.01 = یک درصد)
@@ -1229,6 +1238,27 @@ def augment_metrics_with_change_review(metrics_df: pd.DataFrame, current_dir: st
     return df_out, baseline_path
 
 # ---------------- Main ----------------
+def _aggregate_mode_rows(rows, mode_col):
+    """جدول مقایسه‌ی حالت‌ها: ردیف هر نماد + ردیف «کل» برای هر حالت."""
+    cmp_df = pd.concat(rows, ignore_index=True)
+    agg_rows = []
+    for mode, g in cmp_df.groupby(mode_col, sort=False):
+        n = float(g["تعداد"].sum())
+        w = g["تعداد"].astype(float)
+        wr = float((g["درصد_برد"] * w).sum() / n) if n > 0 else 0.0
+        ar = float((g["میانگین_R"] * w).sum() / n) if n > 0 else 0.0
+        agg_rows.append({
+            mode_col: mode, "نماد": "کل", "تعداد": int(n),
+            "درصد_برد": round(wr, 2), "میانگین_R": round(ar, 3),
+            "بازده_خالص٪": round(float(g["بازده_خالص٪"].mean()), 2),
+            "حداکثر_افت٪": round(float(g["حداکثر_افت٪"].max()), 2),
+            "فاکتور_سود": round(float(g["فاکتور_سود"].mean()), 3),
+        })
+    out = pd.concat([cmp_df, pd.DataFrame(agg_rows)], ignore_index=True)
+    cols = [mode_col, "نماد", "تعداد", "درصد_برد", "میانگین_R", "بازده_خالص٪", "حداکثر_افت٪", "فاکتور_سود"]
+    out = out[[c for c in cols if c in out.columns]]
+    return out.sort_values([mode_col, "نماد"]).reset_index(drop=True)
+
 def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_trade=None,
                      max_open=None, symbols=None):
     """شبیه‌سازی «یک حساب مشترک» روی معاملات همه‌ی نمادها:
@@ -1372,6 +1402,7 @@ def main():
     all_events=[]
     all_zone_reasons=[]
     entry_mode_rows=[]
+    rr_mode_rows=[]
     max_data_time = None
     for zp in zip_files:
         base=os.path.basename(zp)
@@ -1385,7 +1416,18 @@ def main():
                 max_data_time = end_t if max_data_time is None else max(max_data_time, end_t)
 
         mdf, rdf, tdf, zdf, edf, zreason = backtest_one(symbol, h4,d1,w1, years, spreads.get(symbol, 0.0),
-                                                        entry_off=DEFAULT_ENTRY_OFF, m15=m15)
+                                                        entry_off=DEFAULT_ENTRY_OFF, rr=DEFAULT_RR, m15=m15)
+
+        # اجرای RR های دیگر فقط برای مقایسه (گزارش‌های کامل با DEFAULT_RR است)
+        if COMPARE_RR_MODES:
+            for mode_name, rrv in RR_MODES.items():
+                if abs(rrv - DEFAULT_RR) < 1e-12:
+                    m_rr = mdf.copy()
+                else:
+                    m_rr = backtest_one(symbol, h4, d1, w1, years, spreads.get(symbol, 0.0),
+                                        entry_off=DEFAULT_ENTRY_OFF, rr=rrv, m15=m15)[0].copy()
+                m_rr["حالت_RR"] = mode_name
+                rr_mode_rows.append(m_rr)
 
         # اجرای حالت‌های دیگر نقطه‌ی ورود فقط برای مقایسه (بقیه‌ی گزارش‌ها با حالت اصلی است)
         if COMPARE_ENTRY_MODES:
@@ -1584,27 +1626,9 @@ def main():
                 summary_df[c] = np.nan
         summary_out = summary_df[summary_cols].copy()
 
-        # --- شیت مقایسه‌ی حالت‌های نقطه‌ی ورود ---
-        cmp_out = None
-        if COMPARE_ENTRY_MODES and entry_mode_rows:
-            cmp_df = pd.concat(entry_mode_rows, ignore_index=True)
-            agg_rows=[]
-            for mode, g in cmp_df.groupby("حالت_ورود", sort=False):
-                n = float(g["تعداد"].sum())
-                w = g["تعداد"].astype(float)
-                wr = float((g["درصد_برد"]*w).sum()/n) if n>0 else 0.0
-                ar = float((g["میانگین_R"]*w).sum()/n) if n>0 else 0.0
-                agg_rows.append({
-                    "حالت_ورود": mode, "نماد": "کل", "تعداد": int(n),
-                    "درصد_برد": round(wr,2), "میانگین_R": round(ar,3),
-                    "بازده_خالص٪": round(float(g["بازده_خالص٪"].mean()),2),
-                    "حداکثر_افت٪": round(float(g["حداکثر_افت٪"].max()),2),
-                    "فاکتور_سود": round(float(g["فاکتور_سود"].mean()),3),
-                })
-            cmp_out = pd.concat([cmp_df, pd.DataFrame(agg_rows)], ignore_index=True)
-            cmp_cols=["حالت_ورود","نماد","تعداد","درصد_برد","میانگین_R","بازده_خالص٪","حداکثر_افت٪","فاکتور_سود"]
-            cmp_out = cmp_out[[c for c in cmp_cols if c in cmp_out.columns]]
-            cmp_out = cmp_out.sort_values(["حالت_ورود","نماد"]).reset_index(drop=True)
+        # --- شیت‌های مقایسه (نقطه‌ی ورود / RR) ---
+        cmp_out = _aggregate_mode_rows(entry_mode_rows, "حالت_ورود") if (COMPARE_ENTRY_MODES and entry_mode_rows) else None
+        rr_out = _aggregate_mode_rows(rr_mode_rows, "حالت_RR") if (COMPARE_RR_MODES and rr_mode_rows) else None
 
         # --- شبیه‌سازی حساب مشترک (پرتفوی) ---
         port = None
@@ -1617,6 +1641,8 @@ def main():
             summary_out.to_excel(sw, sheet_name="خلاصه", index=False)
             if cmp_out is not None:
                 cmp_out.to_excel(sw, sheet_name="مقایسه_نقطه_ورود", index=False)
+            if rr_out is not None:
+                rr_out.to_excel(sw, sheet_name="مقایسه_RR", index=False)
             if port is not None:
                 port["stats"].to_excel(sw, sheet_name="پرتفوی", index=False)
                 port["yearly"].to_excel(sw, sheet_name="پرتفوی_سالانه", index=False)
