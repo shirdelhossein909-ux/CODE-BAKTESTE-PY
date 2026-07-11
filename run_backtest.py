@@ -34,6 +34,18 @@ RR_MODES = {
 }
 DEFAULT_RR = 3.0  # حالت اصلی گزارش‌های کامل
 
+# قانون «لغو سفارش در صورت دور شدن قیمت»: اگر قیمت بدون فعال کردن سفارش،
+# به اندازه‌ی چند برابرِ ریسک از نقطه‌ی ورود دور شد، سفارش لغو و زون بی‌اعتبار می‌شود.
+# چند آستانه در یک اجرا مقایسه می‌شود — شیت «مقایسه_لغو_دور»
+COMPARE_DISTCANCEL_MODES = True
+DISTCANCEL_MODES = {
+    "بدون قانون": 0.0,
+    "دور شدن 3R": 3.0,
+    "دور شدن 4R": 4.0,
+    "دور شدن 5R": 5.0,
+}
+DEFAULT_DIST_CANCEL_R = 0.0  # حالت اصلی گزارش‌های کامل (فعلاً بدون قانون تا مقایسه را ببینیم)
+
 # فیلتر «حداقل اندازه‌ی زون»: اگر فاصله‌ی ورود تا استاپ کمتر از این ضریب از ATR باشد، معامله نمی‌شود.
 # چند آستانه در یک اجرا مقایسه می‌شود — شیت «مقایسه_حداقل_زون»
 COMPARE_MINRISK_MODES = False  # نتیجه: فیلتر کمکی نکرد؛ بدون فیلتر می‌مانیم
@@ -521,7 +533,7 @@ def log_event(events, t, symbol, zid, etype, detail=""):
 def backtest_one(symbol, h4, d1, w1, years, spread,
                  entry_off=0.10, sl_off=0.25, rr=3.0,
                  reserve=0.15, risk_per_trade=0.01, max_orders=3,
-                 m15=None, min_risk_atr=0.0, return_state=False):
+                 m15=None, min_risk_atr=0.0, dist_cancel_r=0.0, return_state=False):
 
     bt_start = BACKTEST_START
 
@@ -606,6 +618,7 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
         "رد_به_خاطر_زون_کوچک": 0,
         "رد_به_خاطر_سقف_سفارش": 0,
         "لغو_به_خاطر_هفتگی": 0,
+        "لغو_به_خاطر_دور_شدن": 0,
         "لغو_به_خاطر_تست_سوم": 0,
         "انقضا_زون": 0,
         "جایگزینی_زون": 0,
@@ -789,8 +802,9 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
         drg=bool(d1["range"].iloc[di-1])
         hrg=bool(h4["range"].iloc[i-1])
 
-        # بدنه‌ی کندل بسته‌شده‌ی قبلی برای چک لغو هفتگی
+        # کندل بسته‌شده‌ی قبلی برای چک‌های لغو (هفتگی و دور شدن قیمت)
         o_prev=float(h4["open"].iloc[i-1]); c_prev=float(h4["close"].iloc[i-1])
+        h_prev=float(h4["high"].iloc[i-1]); l_prev=float(h4["low"].iloc[i-1])
 
         # ---------- exits for already-open positions ----------
         still_open=[]
@@ -922,6 +936,23 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
                 reasons["لغو_به_خاطر_هفتگی"] += 1
                 set_final(zone_df, p["z"].zone_id, "لغو شد", "زون مخالف هفتگی (بدنه)", t)
                 log_event(events, t, symbol, p["z"].zone_id, "Canceled", "WeeklyOpp")
+
+        # ---------- لغو به‌خاطر دور شدن قیمت بدون فعال شدن سفارش (اختیاری) ----------
+        if dist_cancel_r > 0:
+            for p in pending:
+                if not p["active"] or p["filled"]:
+                    continue
+                if p["z"].direction == "BUY":
+                    far = h_prev >= p["entry"] + dist_cancel_r * p["risk"]
+                else:
+                    far = l_prev <= p["entry"] - dist_cancel_r * p["risk"]
+                if far:
+                    p["active"] = False
+                    p["cancel"] = "لغو: دور شدن قیمت"
+                    reasons["لغو_به_خاطر_دور_شدن"] += 1
+                    set_final(zone_df, p["z"].zone_id, "لغو شد",
+                              f"قیمت {dist_cancel_r:g}R دور شد بدون ورود", t)
+                    log_event(events, t, symbol, p["z"].zone_id, "Canceled", "FarAway")
 
         # ---------- fills + (NEW) exit-same-bar ----------
         new_open_positions = []
@@ -1547,6 +1578,7 @@ def main():
     entry_mode_rows=[]
     rr_mode_rows=[]
     minrisk_mode_rows=[]
+    distcancel_mode_rows=[]
     max_data_time = None
     for zp in zip_files:
         base=os.path.basename(zp)
@@ -1573,6 +1605,18 @@ def main():
                                         entry_off=DEFAULT_ENTRY_OFF, rr=rrv, m15=m15)[0].copy()
                 m_rr["حالت_RR"] = mode_name
                 rr_mode_rows.append(m_rr)
+
+        # مقایسه‌ی آستانه‌های «لغو در صورت دور شدن قیمت»
+        if COMPARE_DISTCANCEL_MODES:
+            for mode_name, dcr in DISTCANCEL_MODES.items():
+                if abs(dcr - DEFAULT_DIST_CANCEL_R) < 1e-12:
+                    m_dc = mdf.copy()
+                else:
+                    m_dc = backtest_one(symbol, h4, d1, w1, years, spreads.get(symbol, 0.0),
+                                        entry_off=DEFAULT_ENTRY_OFF, rr=DEFAULT_RR, m15=m15,
+                                        dist_cancel_r=dcr)[0].copy()
+                m_dc["قانون_لغو_دور"] = mode_name
+                distcancel_mode_rows.append(m_dc)
 
         # مقایسه‌ی آستانه‌های فیلتر «حداقل اندازه‌ی زون»
         if COMPARE_MINRISK_MODES:
@@ -1790,6 +1834,7 @@ def main():
         cmp_out = _aggregate_mode_rows(entry_mode_rows, "حالت_ورود") if (COMPARE_ENTRY_MODES and entry_mode_rows) else None
         rr_out = _aggregate_mode_rows(rr_mode_rows, "حالت_RR") if (COMPARE_RR_MODES and rr_mode_rows) else None
         mr_out = _aggregate_mode_rows(minrisk_mode_rows, "حداقل_زون") if (COMPARE_MINRISK_MODES and minrisk_mode_rows) else None
+        dc_out = _aggregate_mode_rows(distcancel_mode_rows, "قانون_لغو_دور") if (COMPARE_DISTCANCEL_MODES and distcancel_mode_rows) else None
 
         # --- شبیه‌سازی حساب مشترک (پرتفوی) ---
         port = None
@@ -1806,6 +1851,8 @@ def main():
                 rr_out.to_excel(sw, sheet_name="مقایسه_RR", index=False)
             if mr_out is not None:
                 mr_out.to_excel(sw, sheet_name="مقایسه_حداقل_زون", index=False)
+            if dc_out is not None:
+                dc_out.to_excel(sw, sheet_name="مقایسه_لغو_دور", index=False)
             if port is not None:
                 port["stats"].to_excel(sw, sheet_name="پرتفوی", index=False)
                 port["yearly"].to_excel(sw, sheet_name="پرتفوی_سالانه", index=False)
