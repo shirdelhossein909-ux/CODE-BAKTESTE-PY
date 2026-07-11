@@ -6,7 +6,7 @@
   2) اتصال به ترمینال متاتریدر (باید باز و لاگین باشد)
   3) دمو بودن حساب (روی حساب واقعی هیچ اوردری نمی‌فرستد!)
   4) پیدا کردن نمادهای سبد (حتی اگر بروکر پسوند داشته باشد مثل AUDJPY.r)
-  5) گرفتن کندل‌های H4 و M15 از یک نماد
+  5) گرفتن کندل‌های H4 و D1 و W1 از یک نماد
   6) ارسال یک «پندینگ اوردر» با حداقل حجم، خیلی دور از قیمت (هرگز اجرا نمی‌شود) و حذف فوری آن
 
 اجرا:  python test_mt5_connection.py
@@ -62,10 +62,12 @@ acc = mt5.account_info()
 if acc is None:
     bad("اطلاعات حساب نیامد — لاگین نیستی؟")
     die("در متاتریدر روی حساب دمو لاگین کن.")
-kinds = {0: "واقعی", 1: "دمو", 2: "مسابقه"}
+kinds = {mt5.ACCOUNT_TRADE_MODE_DEMO: "دمو",
+         mt5.ACCOUNT_TRADE_MODE_CONTEST: "مسابقه",
+         mt5.ACCOUNT_TRADE_MODE_REAL: "واقعی"}
 kind = kinds.get(acc.trade_mode, "نامشخص")
 print(f"  حساب: {acc.login} | {acc.server} | {acc.currency} | نوع: {kind} | بالانس: {acc.balance:,.2f}")
-if acc.trade_mode != 1:
+if acc.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO:
     bad("این حساب دمو نیست!")
     die("برای تست فقط حساب دمو. در متاتریدر: File → Open an Account → حساب دمو بساز و لاگین کن.")
 ok("حساب دمو است — ادامه می‌دهیم")
@@ -102,7 +104,7 @@ print(f"  جمع: {len(resolved)} از {len(BASKET)} نماد آماده")
 # ---------- قدم 5: دیتا ----------
 step(5, "گرفتن کندل از بروکر")
 test_sym = resolved.get("AUDJPY") or list(resolved.values())[0]
-for tf_name, tf in [("H4", mt5.TIMEFRAME_H4), ("M15", mt5.TIMEFRAME_M15), ("D1", mt5.TIMEFRAME_D1), ("W1", mt5.TIMEFRAME_W1)]:
+for tf_name, tf in [("H4", mt5.TIMEFRAME_H4), ("D1", mt5.TIMEFRAME_D1), ("W1", mt5.TIMEFRAME_W1)]:
     rates = mt5.copy_rates_from_pos(test_sym, tf, 0, 10)
     if rates is None or len(rates) == 0:
         bad(f"{test_sym} {tf_name}: کندل نیامد ({mt5.last_error()})")
