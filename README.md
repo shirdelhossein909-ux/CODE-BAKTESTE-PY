@@ -1,65 +1,99 @@
-# CODE-BAKTESTE-PY
+# بک‌تستر استراتژی عرضه و تقاضا (پروژه زد)
 
-A multi-timeframe **supply/demand zone backtester** for forex pairs and metals (XAUUSD, XAGUSD), built with pandas/NumPy. It reads MetaTrader-exported price history, simulates a zone-based limit-order strategy, and produces detailed Excel reports (in Persian) including distribution and time-behavior analytics.
+این مخزن شامل یک **بک‌تستر چندتایم‌فریمی مبتنی بر زون‌های عرضه و تقاضا** برای جفت‌ارزهای فارکس و فلزات (طلا و نقره) است که با پایتون (pandas و NumPy) نوشته شده است. هدف نهایی پروژه، تبدیل این استراتژی به یک ربات معامله‌گر خودکار متصل به متاتریدر ۵ است؛ این بک‌تستر ترازوی سنجش استراتژی قبل از رسیدن به بازار واقعی است.
 
-## How it works
+---
 
-The strategy operates on three timeframes per symbol:
+## فایل‌های پروژه
 
-- **Weekly (W1)** — builds higher-timeframe supply/demand zones used as a filter.
-- **Daily (D1)** — trend detection (from swing points) and range filter (ATR-based).
-- **4-hour (H4)** — builds the tradeable zones, places pending limit orders, and manages positions candle by candle.
-
-Zones are detected from base/consolidation candles, deduplicated by overlap, and tracked through a full lifecycle (touch 1, touch 2, order placement, fill, cancel, expiry) with an event log and a final status/reason per zone.
-
-Key parameters (see `backtest_one` in `run_backtest.py`):
-
-| Parameter | Default |
+| فایل | نقش |
 |---|---|
-| Backtest start | 2023-01-01 (through end of available data) |
-| Starting equity | 100,000 |
-| Risk per trade | 1% of usable equity |
-| Reserve capital | 15% |
-| Reward:risk | 3.0 |
-| Entry offset | default 10% of zone height inside the zone (past the proximal line); the summary report also compares −10%/−25%/−50% entries side by side |
-| Stop-loss offset | 25% of zone height beyond the distal line, away from price |
-| Max simultaneous orders | 3 |
-| Costs | commission ≈ 0.5×spread (round-trip) + swap ≈ 0.2×spread per night held; per-symbol spreads defined in `main()` |
+| `run_backtest.py` | فایل اصلی: خواندن دیتا، ساخت زون‌ها، موتور بک‌تست، شبیه‌سازی پرتفوی، و تولید گزارش‌های اکسل |
+| `analysis_distribution.py` | تحلیل‌های آماری تکمیلی روی معاملات (توزیع R، رشته‌های برد/باخت، رفتار زمانی، امتیاز پایداری و…) — هیچ دخالتی در منطق استراتژی ندارد |
 
-The backtest avoids look-ahead bias: trend/range filters and the weekly-cancel check use only closed candles, zones activate after their confirmation candle closes, and overlapping-zone dedup is point-in-time (a newer zone replaces older ones only from its own creation time).
+---
 
-## Files
+## منطق استراتژی (خلاصه)
 
-- **`run_backtest.py`** — main script: data loading, indicators (ATR, swing trend, range filter), zone construction, the backtest engine, portfolio/equity accounting, versioned change review against a previous run's baseline, and Excel report generation.
-- **`analysis_distribution.py`** — post-trade analytics only (no strategy logic): R-multiple histograms, win/loss streaks, hold-time stats, weekday/hour/month/season distributions, weekday×hour heatmap, rolling 3-month performance, activity metrics, a stability score, and a managerial summary. Consumed by `run_backtest.py` via `distribution_sheets()`.
+- **سه تایم‌فریم برای هر نماد:** هفتگی (فیلتر زون مخالف)، روزانه (روند و فیلتر رنج)، چهارساعته (زون‌های معاملاتی و اجرای معامله).
+- **ساخت زون:** از کندل‌های بیس (بدنه‌ی کوچک) به‌همراه کندل تأیید قوی؛ زون‌های هم‌پوشان به‌صورت «در لحظه» ادغام می‌شوند (زون جدید فقط از زمان تولد خودش جایگزین قبلی می‌شود).
+- **ورود:** سفارش در **۵۰٪ عمق زون (وسط زون)** — این نقطه پس از مقایسه‌ی پنج حالت مختلف ورود انتخاب شد.
+- **حد ضرر:** ۲۵٪ ارتفاع زون آن‌طرفِ دیستال‌لاین (دورتر از قیمت).
+- **حد سود:** ۳ برابر فاصله‌ی ورود تا استاپ (RR=3) — پس از مقایسه‌ی RRهای ۲ تا ۶ انتخاب شد.
+- **فیلترها:** هم‌جهت بودن روند روزانه و چهارساعته، رد شدن در بازار رنج، لغو سفارش در برخورد با زون مخالف هفتگی، ممنوعیت تست سوم زون، سقف سفارش هم‌زمان.
+- **مدیریت سرمایه:** ریسک هر معامله ۱٪ از سرمایه‌ی قابل استفاده، ۱۵٪ سرمایه‌ی رزرو، حداکثر ۳ سفارش هم‌زمان در هر نماد.
 
-## Input data
+---
 
-The script expects one ZIP file per symbol in `%USERPROFILE%\Desktop\0` (e.g. `USDJPY.W.D.H4.zip` — the symbol is taken from the part before the first dot). Each ZIP must contain three MetaTrader CSV exports (no header row; columns: date, time, open, high, low, close[, volume]):
+## چه چیزهایی این بک‌تست را «واقع‌بینانه» می‌کند؟
 
-- `*-240.csv` — H4
-- `*-1D.csv` — daily
-- `*-1W.csv` — weekly
-- `*-15.csv` — M15 (optional but recommended): used to resolve intra-candle ambiguity — when SL and TP are both touched within one H4 candle, and on the entry candle (fill moment first, then only post-fill highs/lows count). Without M15 the engine falls back to the pessimistic rule (SL wins) and reports how many cases lacked M15.
+این مهم‌ترین بخش این پروژه است. نسخه‌های اولیه سودهای رؤیایی (چند صد درصد با افت ناچیز) نشان می‌دادند که پس از بررسی، معلوم شد محصول خطاهای رایج بک‌تست‌نویسی است. به‌مرور این اصلاحات انجام شد:
 
-Change the `datadir` path in `main()` if your data lives elsewhere.
+1. **حذف کامل «نگاه به آینده»:**
+   - فیلترهای روند و رنج فقط از کندل‌های **بسته‌شده** خوانده می‌شوند (کندل قبلی H4 و آخرین کندل کامل روزانه)، نه کندلی که هنوز در جریان است.
+   - زون‌ها فقط بعد از بسته شدن کندلِ تأییدشان فعال می‌شوند؛ زون هفتگی بعد از بسته شدن کندل هفتگی.
+   - ادغام زون‌های هم‌پوشان به‌صورت نقطه‌به‌نقطه در زمان انجام می‌شود، نه از روی کل تاریخ.
+   - چک لغو هفتگی با بدنه‌ی کندل قبلیِ بسته‌شده انجام می‌شود.
+2. **هزینه‌های معاملاتی:** کمیسیون (نصف اسپرد، رفت‌وبرگشت) و سواپ شبانه (۲۰٪ اسپرد به ازای هر شب نگهداری) از نتیجه‌ی هر معامله کسر می‌شود. اسپرد هر نماد در `main()` تعریف شده است.
+3. **گرم شدن اندیکاتورها:** تا وقتی فیلتر رنج (نیازمند ۲۰ کندل) آماده نشده، هیچ معامله‌ای گرفته نمی‌شود. (قبلاً در شروعِ دیتا سیل معاملات بی‌فیلتر رخ می‌داد — رفع شد.)
+4. **رفتار بدبینانه در ابهام:** اگر در یک کندل H4 هم حد سود و هم حد ضرر لمس شود، **استاپ** حساب می‌شود.
+5. **ستون‌های شفافیت در گزارش:** برای اینکه هیچ ابهامی پنهان نماند، برای هر نماد گزارش می‌شود:
+   - تعداد و درصد معاملات مبهم (لمس هم‌زمان TP و استاپ در یک کندل) + برایند در دو سناریوی «همه TP» و «همه استاپ»
+   - تعداد بردهایی که در همان کندل ورود بسته شده‌اند + برایند اگر همه‌ی آن‌ها استاپ می‌شدند (کفِ مطلق نتیجه)
+   - میانگین فاصله‌ی استاپ و حد سود به پیپ
+6. **شبیه‌سازی پرتفوی با حساب مشترک:** همه‌ی معاملات به ترتیب زمان وارد «یک حساب» می‌شوند؛ ریسک هر معامله درصدی از اکویتی همان لحظه، با سقف پوزیشن هم‌زمان برای کل حساب. خروجی: بازده و حداکثر افت واقعی حساب + بازده سالانه و ماهانه.
 
-## Output
+---
 
-Reports are written to a `خروجی` ("output") folder next to the script:
+## آزمایش‌هایی که انجام شد و نتیجه‌شان
 
-- **`خلاصه_نتایج.xlsx`** — per-symbol summary: win %, net return %, average R, max drawdown %, profit factor, trade count.
-- **`جزئیات_حرفه‌ای.xlsx`** — multi-sheet detailed report: overview, per-symbol metrics, trades by symbol/year, zone statistics, annual/monthly returns, rejection reasons, plus all distribution-analysis sheets.
+| آزمایش | نتیجه |
+|---|---|
+| مقایسه‌ی ۵ نقطه‌ی ورود (۱۰٪ بیرون زون تا ۷۵٪ داخل زون) | **۵۰٪ داخل زون (وسط زون)** بهترین بود؛ ورودِ بیرون زون حتی ضررده بود |
+| مقایسه‌ی ریوارد ۲ تا ۶ | **RR=3** بهترین تعادل برد/سود/افت را داشت |
+| فیلتر حداقل اندازه‌ی زون (۰.۵ تا ۱ برابر ATR) | کمکی نکرد — بدون فیلتر بهتر بود؛ غیرفعال شد |
+| راستی‌آزمایی با تایم‌فریم M15 | نشان داد بخش قابل توجهی از بردهای «همان‌کندلی» در دنیای واقعی قطعی نیستند؛ به تصمیم مالک پروژه این قانون غیرفعال شد و به‌جای آن ستون‌های شفافیت (کف و سقف نتیجه) اضافه شد. قضاوت نهایی با تست دمو خواهد بود |
+| آزمون خارج از نمونه (دوره‌ای که در هیچ تصمیمی نقش نداشت) | استراتژی مثبت ماند — لبه‌ی واقعی وجود دارد |
 
-If a previous version's results are found in a sibling folder, the metrics sheet also includes delta columns comparing this run against that baseline.
+---
 
-The summary file also contains portfolio sheets (`پرتفوی`, `پرتفوی_سالانه`, `پرتفوی_ماهانه`) that replay all trades chronologically through **one shared account** (1% risk of live equity per trade, global cap on simultaneous positions — see `PORTFOLIO_MAX_OPEN` / `PORTFOLIO_SYMBOLS`). The backtest window is configurable via `BACKTEST_START` / `BACKTEST_END` for out-of-sample testing.
+## ایرادهایی که در طول پروژه پیدا و رفع شد
 
-## Requirements
+- سود ۳۶۷٪ نسخه‌ی اولیه توهم بود: فیلترها با قیمتِ بسته‌ی همان کندل تصمیم می‌گرفتند، ادغام زون‌ها آینده را می‌دید، و اسپرد دوبار به نفع استراتژی حساب می‌شد.
+- در شروع دیتا، قبل از آماده شدن فیلتر رنج، معاملات بی‌فیلتر ثبت می‌شد.
+- فایل‌های کش پایتون (`__pycache__`) و خروجی‌ها از مخزن حذف و در `.gitignore` قرار گرفتند.
+- خواننده‌ی CSV هوشمند شد: فرمت متاتریدر (بدون سطر عنوان)، فرمت‌های عنوان‌دار (مثل FXCM با ستون‌های BidOpen/…)، تاریخ‌وساعت جدا یا یکجا، و ترتیب روز/ماه اروپایی/آمریکایی به‌صورت خودکار تشخیص داده می‌شود.
 
-- Python 3.9+
-- Required: `pandas`, `numpy`, `openpyxl`
-- Optional: `matplotlib` (plots), `reportlab` + `arabic-reshaper` + `python-bidi` (Persian PDF journal — not produced in the current version)
+---
+
+## دیتای ورودی
+
+برای هر نماد یک فایل ZIP در مسیر `Desktop\0` با **نام نماد** (مثلاً `AUDCAD.zip` — پیشوندهایی مثل `FXCM_` یا `FOREXCOM_` در نام فایل‌های داخلی مشکلی ندارند). داخل هر زیپ (زیرپوشه هم قابل قبول است):
+
+- `*-240.csv` — چهارساعته (اجباری)
+- `*-1D.csv` — روزانه (اجباری)
+- `*-1W.csv` — هفتگی (اجباری)
+- `*-15.csv` — پانزده دقیقه (اختیاری؛ فقط اگر `USE_M15` روشن باشد استفاده می‌شود)
+
+## تنظیمات اصلی (بالای `run_backtest.py`)
+
+| ثابت | مقدار فعلی | توضیح |
+|---|---|---|
+| `BACKTEST_START` / `BACKTEST_END` | بسته به دیتا | بازه‌ی بک‌تست؛ `None` یعنی تا انتهای دیتا |
+| `DEFAULT_ENTRY_OFF` | `-0.50` | ورود در ۵۰٪ عمق زون |
+| `DEFAULT_RR` | `3.0` | نسبت سود به ضرر |
+| `USE_M15` | `False` | راستی‌آزمایی داخل کندل با M15 |
+| `COMMISSION_SPREAD_MULT` / `SWAP_SPREAD_MULT_PER_NIGHT` | `0.5` / `0.2` | هزینه‌ها نسبت به اسپرد |
+| `PORTFOLIO_RISK_PER_TRADE` | `0.005` | ریسک هر معامله در شبیه‌سازی پرتفوی (نیم درصد) |
+| `PORTFOLIO_MAX_OPEN` | `5` | سقف پوزیشن هم‌زمان کل حساب |
+| `PORTFOLIO_SYMBOLS` | `[]` | سبد پرتفوی؛ خالی = همه‌ی نمادها |
+
+## خروجی‌ها (پوشه‌ی «خروجی»)
+
+- **`خلاصه_نتایج.xlsx`** — شیت «خلاصه» (شاخص‌های هر نماد + ستون‌های شفافیت)، شیت‌های مقایسه (در صورت فعال بودن)، و شیت‌های «پرتفوی» / «پرتفوی_سالانه» / «پرتفوی_ماهانه»
+- **`جزئیات_حرفه‌ای.xlsx`** — گزارش کامل: نتایج اعدادی، معاملات به تفکیک نماد و سال، زون‌ها، بازده سالانه/ماهانه، دلایل رد و لغو (شامل شمارنده‌های حسابرسی)، و ده‌ها شیت تحلیل توزیع و رفتار زمانی
+
+## اجرا
 
 ```bash
 pip install pandas numpy openpyxl
@@ -68,11 +102,16 @@ python run_backtest.py
 
 ---
 
-## معرفی (فارسی)
+## محدودیت‌های شناخته‌شده
 
-این پروژه یک بک‌تستر چندتایم‌فریمی مبتنی بر **زون‌های عرضه و تقاضا** برای جفت‌ارزهای فارکس و فلزات است. داده‌های خروجی متاتریدر (H4، روزانه و هفتگی) به‌صورت ZIP از پوشه‌ی `Desktop\0` خوانده می‌شود، استراتژی از ابتدای ۲۰۲۳ شبیه‌سازی می‌شود و نتایج در پوشه‌ی «خروجی» در دو فایل اکسل ذخیره می‌گردد:
+- سرنوشت واقعی بردهایی که در همان کندل ورود بسته می‌شوند، از روی دیتای H4 قطعی نیست؛ گزارش، کف و سقف نتیجه را شفاف نشان می‌دهد و داور نهایی، تست روی حساب دمو است.
+- کمیسیون و سواپ تقریبی‌اند؛ پیش از معامله‌ی واقعی باید با اعداد بروکر تنظیم شوند.
+- اسلیپیج (لغزش قیمت در اجرا) صفر فرض شده است.
 
-- **خلاصه_نتایج.xlsx** — شاخص‌های کلیدی هر نماد (درصد برد، بازده خالص، میانگین R، حداکثر افت، فاکتور سود، تعداد معاملات)
-- **جزئیات_حرفه‌ای.xlsx** — گزارش کامل شامل نتایج اعدادی، معاملات، زون‌ها، بازده سالانه/ماهانه، دلایل حذف زون‌ها و تحلیل‌های توزیع و رفتار زمانی معاملات
+## نقشه‌ی راه
 
-پارامترهای اصلی: ریسک هر معامله ۱٪، سرمایه‌ی رزرو ۱۵٪، نسبت سود به ضرر ۳، حداکثر ۳ سفارش هم‌زمان.
+1. ✅ واقع‌بینانه‌سازی بک‌تست و نهایی کردن پارامترها (ورود ۵۰٪، RR=3)
+2. ✅ انتخاب سبد نمادها بر اساس بک‌تست بلندمدت
+3. ⬜ ساخت ربات واسط متاتریدر ۵ (`live_trader.py`) با همین قوانین + لاگ کامل تصمیم‌ها
+4. ⬜ تست چندماهه روی حساب دمو و مقایسه‌ی مو‌به‌موی رفتار ربات با بک‌تست
+5. ⬜ در صورت موفقیت دمو: اجرای واقعی با ریسک کم
