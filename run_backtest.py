@@ -1094,7 +1094,67 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
                 "entry": float(pos["eff_entry"]), "sl": float(pos["sl"]), "tp": float(pos["tp"]),
                 "fill_time": pos["fill_time"],
             } for pos in open_pos],
+            "armed": [],
+            "فیلتر_توضیح": "",
         }
+
+        # زون‌های «آماده‌باش» برای لایو: هنوز تاچ نشده‌اند ولی اگر قیمت وسط کندل بیاید،
+        # سفارش از قبل داخل متاتریدر هست و جا نمی‌مانیم (معادل پر شدن داخل کندل در بک‌تست).
+        if len(h4) >= 2 and len(d1) >= 2:
+            t_last = h4["time"].iloc[-1]
+            o_last = float(h4["open"].iloc[-1]); c_last = float(h4["close"].iloc[-1])
+            drg_now = d1["range"].iloc[-1]; hrg_now = h4["range"].iloc[-1]
+            dtr_now = int(d1["trend"].iloc[-1]); htr_now = int(h4["trend"].iloc[-1])
+            warm = (not pd.isna(drg_now)) and (not pd.isna(hrg_now))
+            filters_ok = warm and (not bool(drg_now)) and (not bool(hrg_now)) \
+                and dtr_now != 0 and htr_now == dtr_now
+
+            trend_txt = {1: "صعودی", -1: "نزولی", 0: "بدون روند"}
+            state["فیلتر_توضیح"] = (
+                f"روند روزانه: {trend_txt.get(dtr_now)} | روند H4: {trend_txt.get(htr_now)} | "
+                f"رنج روزانه: {'بله' if warm and bool(drg_now) else 'خیر'} | "
+                f"رنج H4: {'بله' if warm and bool(hrg_now) else 'خیر'}"
+            )
+
+            if filters_ok:
+                wz_now = [wz for wz in w_z
+                          if wz.created_time + pd.Timedelta(days=7) <= t_last
+                          and (wz.superseded_time is None or t_last < wz.superseded_time)]
+                armed = []
+                for z in h_z:
+                    if z.created_time >= t_last or z.expired or id(z) in used:
+                        continue
+                    if z.superseded_time is not None and t_last >= z.superseded_time:
+                        continue
+                    if z.touch_count != 0:
+                        continue
+                    opp_dir = "SELL" if z.direction == "BUY" else "BUY"
+                    if any(body_overlaps_zone(o_last, c_last, wz) for wz in wz_now if wz.direction == opp_dir):
+                        continue
+                    height = z.high() - z.low()
+                    if height <= 0:
+                        continue
+                    if z.direction == "BUY":
+                        entry = z.proximal + entry_off * height
+                        sl = z.distal - sl_off * height
+                        risk = entry - sl
+                        tp = entry + rr * risk
+                    else:
+                        entry = z.proximal - entry_off * height
+                        sl = z.distal + sl_off * height
+                        risk = sl - entry
+                        tp = entry - rr * risk
+                    if risk <= 0:
+                        continue
+                    armed.append({"zone_id": z.zone_id, "direction": z.direction,
+                                  "entry": float(entry), "sl": float(sl), "tp": float(tp),
+                                  "placed_time": t_last, "test": 0,
+                                  "dist": float(abs(c_last - z.proximal))})
+                # نزدیک‌ترین زون‌ها به قیمت، تا سقف سفارش هم‌زمانِ هر نماد
+                armed.sort(key=lambda a: a["dist"])
+                n_slots = max(0, max_orders - len(state["pending"]))
+                state["armed"] = armed[:n_slots]
+
         return metrics_df, reasons_df, tdf, zone_df, events_df, z_reason, state
 
     return metrics_df, reasons_df, tdf, zone_df, events_df, z_reason
