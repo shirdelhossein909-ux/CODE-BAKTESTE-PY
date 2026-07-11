@@ -24,8 +24,9 @@ ENTRY_MODES = {
 DEFAULT_ENTRY_OFF = -0.50  # حالت اصلی که گزارش‌های کامل با آن ساخته می‌شود
 
 # --- بک‌تست پرتفویی: شبیه‌سازی یک حساب مشترک برای همه‌ی نمادها (شیت‌های «پرتفوی») ---
-PORTFOLIO_MAX_OPEN = 5   # حداکثر پوزیشن باز هم‌زمان در کل حساب
-PORTFOLIO_SYMBOLS = []   # خالی = همه‌ی نمادها؛ نمونه: ["AUDCAD","EURUSD","CHFJPY","XAUUSD","GBPCAD"]
+PORTFOLIO_MAX_OPEN = 5              # حداکثر پوزیشن باز هم‌زمان در کل حساب
+PORTFOLIO_RISK_PER_TRADE = 0.005    # ریسک هر معامله از اکویتی حساب (0.005 = نیم درصد، 0.01 = یک درصد)
+PORTFOLIO_SYMBOLS = []              # خالی = همه‌ی نمادها؛ نمونه: ["AUDCAD","EURUSD","CHFJPY","XAUUSD","GBPCAD"]
 
 # (خروجی PDF/ژورنال در نسخه 1.9 تولید نمی‌شود)
 # این وابستگی‌ها اختیاری هستند؛ اگر نصب نبودند، بک‌تست همچنان اجرا می‌شود.
@@ -1061,7 +1062,7 @@ def augment_metrics_with_change_review(metrics_df: pd.DataFrame, current_dir: st
     return df_out, baseline_path
 
 # ---------------- Main ----------------
-def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_trade=0.01,
+def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_trade=None,
                      max_open=None, symbols=None):
     """شبیه‌سازی «یک حساب مشترک» روی معاملات همه‌ی نمادها:
     معامله‌ها به ترتیب زمان ورود اجرا می‌شوند، ریسک هر معامله ۱٪ از اکویتی لحظه‌ای حساب است،
@@ -1084,6 +1085,8 @@ def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_tr
         return None
     if max_open is None:
         max_open = PORTFOLIO_MAX_OPEN
+    if risk_per_trade is None:
+        risk_per_trade = PORTFOLIO_RISK_PER_TRADE
 
     eq = float(start_equity); peak = eq; max_dd = 0.0
     open_heap = []   # (زمان_خروج, ردیف, مبلغ_ریسک, R)
@@ -1122,6 +1125,7 @@ def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_tr
     stats = pd.DataFrame([{
         "تعداد_نماد": int(t["نماد"].nunique()),
         "سقف_پوزیشن_همزمان": int(max_open),
+        "ریسک_هر_معامله٪": round(risk_per_trade * 100.0, 2),
         "معاملات_انجام‌شده": int(taken),
         "معاملات_ردشده_به_خاطر_سقف": int(skipped),
         "درصد_برد": round(wins / len(rs) * 100.0, 2) if rs else 0.0,
