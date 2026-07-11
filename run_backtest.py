@@ -6,8 +6,10 @@ import numpy as np
 from analysis_distribution import distribution_sheets
 import pandas as pd
 
-# استفاده از M15 برای رفع ابهام داخل کندل (برای مقایسه می‌توانی False کنی)
-USE_M15 = True
+# استفاده از M15 برای رفع ابهام داخل کندل — طبق تصمیم: خاموش.
+# معاملات مبهم (TP و استاپ در یک کندل H4) بدبینانه استاپ حساب می‌شوند
+# و تعداد/اثرشان در ستون‌های «مبهم_...» گزارش می‌شود.
+USE_M15 = False
 
 # بازه‌ی بک‌تست: در صورت نیاز این دو خط را تغییر بده
 BACKTEST_START = pd.Timestamp("2022-11-22")  # شروع دیتای FXCM
@@ -25,12 +27,10 @@ ENTRY_MODES = {
 }
 DEFAULT_ENTRY_OFF = -0.50  # حالت اصلی که گزارش‌های کامل با آن ساخته می‌شود
 
-# مقایسه‌ی نسبت سود به ضرر (RR) در یک اجرا — نتایج در شیت «مقایسه_RR»
-COMPARE_RR_MODES = True
+# مقایسه‌ی نسبت سود به ضرر (RR) — غیرفعال؛ RR نهایی: 3
+COMPARE_RR_MODES = False
 RR_MODES = {
     "RR=3.0": 3.0,
-    "RR=2.5": 2.5,
-    "RR=2.0": 2.0,
 }
 DEFAULT_RR = 3.0  # حالت اصلی گزارش‌های کامل
 
@@ -992,7 +992,9 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
     if tdf.empty:
         metrics={
             "نماد":symbol,"تعداد":0,"درصد_برد":0.0,"فاکتور_سود":0.0,
-            "بازده_خالص٪":0.0,"حداکثر_افت٪":0.0,"میانگین_R":0.0
+            "بازده_خالص٪":0.0,"حداکثر_افت٪":0.0,"میانگین_R":0.0,
+            "مبهم_تعداد":0,"مبهم_درصد":0.0,
+            "بازده٪_اگر_مبهم_TP":0.0,"بازده٪_اگر_مبهم_استاپ":0.0
         }
     else:
         wins=tdf.loc[tdf["نتیجه_R"]>0,"نتیجه_R"].sum()
@@ -1000,11 +1002,29 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
         pf=float(wins/loss) if loss>0 else 999.0
         winrate=float((tdf["نتیجه_R"]>0).mean()*100.0)
         net=float((equity-100000.0)/100000.0*100.0)
-        # max_dd همینجا محاسبه شده
+
+        # --- تحلیل معاملات مبهم (TP و استاپ هر دو در یک کندل H4 لمس شده) ---
+        amb = tdf["علت_خروج"].astype(str).str.contains("هر دو در یک کندل")
+        n_amb = int(amb.sum())
+
+        def _net_with(r_series):
+            eq = 100000.0
+            for r in r_series:
+                eq += eq * (1.0 - reserve) * risk_per_trade * float(r)
+            return round((eq - 100000.0) / 100000.0 * 100.0, 2)
+
+        risk_d = (tdf["ورود"] - tdf["حدضرر"]).abs().replace(0, np.nan)
+        r_if_tp = (tdf["حدسود"] - tdf["ورود"]).abs() / risk_d - commission_cost / risk_d
+        rs_if_tp = tdf["نتیجه_R"].where(~amb, r_if_tp).fillna(tdf["نتیجه_R"])
+        net_if_tp = _net_with(rs_if_tp)      # اگر همه‌ی مبهم‌ها TP بودند
+        net_if_sl = _net_with(tdf["نتیجه_R"])  # مبهم‌ها همین حالا استاپ حساب شده‌اند
+
         metrics={
             "نماد":symbol,"تعداد":int(len(tdf)),"درصد_برد":round(winrate,2),
             "فاکتور_سود":round(pf,3),"بازده_خالص٪":round(net,2),
-            "حداکثر_افت٪":round(max_dd*100.0,2),"میانگین_R":round(float(tdf["نتیجه_R"].mean()),3)
+            "حداکثر_افت٪":round(max_dd*100.0,2),"میانگین_R":round(float(tdf["نتیجه_R"].mean()),3),
+            "مبهم_تعداد":n_amb,"مبهم_درصد":round(n_amb/len(tdf)*100.0,2),
+            "بازده٪_اگر_مبهم_TP":net_if_tp,"بازده٪_اگر_مبهم_استاپ":net_if_sl
         }
 
     reasons_df=pd.DataFrame([{"نماد":symbol,"دلیل":k,"تعداد":int(v)} for k,v in reasons.items()])
@@ -1619,7 +1639,8 @@ def main():
             summary_df["درصد_لاس"] = np.nan
 
         summary_cols = [
-            "نماد", "درصد_برد", "درصد_لاس", "بازده_خالص٪", "میانگین_R", "حداکثر_افت٪", "فاکتور_سود", "تعداد"
+            "نماد", "درصد_برد", "درصد_لاس", "بازده_خالص٪", "میانگین_R", "حداکثر_افت٪", "فاکتور_سود", "تعداد",
+            "مبهم_تعداد", "مبهم_درصد", "بازده٪_اگر_مبهم_TP", "بازده٪_اگر_مبهم_استاپ"
         ]
         for c in summary_cols:
             if c not in summary_df.columns:
