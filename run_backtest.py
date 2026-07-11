@@ -521,7 +521,7 @@ def log_event(events, t, symbol, zid, etype, detail=""):
 def backtest_one(symbol, h4, d1, w1, years, spread,
                  entry_off=0.10, sl_off=0.25, rr=3.0,
                  reserve=0.15, risk_per_trade=0.01, max_orders=3,
-                 m15=None, min_risk_atr=0.0):
+                 m15=None, min_risk_atr=0.0, return_state=False):
 
     bt_start = BACKTEST_START
 
@@ -1080,6 +1080,22 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
 
     z_reason = zone_df.groupby(["نماد","FinalStatus","FinalReason"]).size().reset_index(name="تعداد")
     z_reason["درصد"] = z_reason.groupby("نماد")["تعداد"].transform(lambda s: (s/s.sum()*100.0).round(2))
+
+    if return_state:
+        # وضعیت «همین الان» برای ربات لایو: سفارش‌های در انتظارِ فعال و پوزیشن‌های باز
+        state = {
+            "pending": [{
+                "zone_id": p["z"].zone_id, "direction": p["z"].direction,
+                "entry": float(p["entry"]), "sl": float(p["sl"]), "tp": float(p["tp"]),
+                "placed_time": p["t"], "test": p["test"],
+            } for p in pending if p["active"] and not p["filled"]],
+            "open": [{
+                "zone_id": pos["ZoneID"], "direction": pos["direction"],
+                "entry": float(pos["eff_entry"]), "sl": float(pos["sl"]), "tp": float(pos["tp"]),
+                "fill_time": pos["fill_time"],
+            } for pos in open_pos],
+        }
+        return metrics_df, reasons_df, tdf, zone_df, events_df, z_reason, state
 
     return metrics_df, reasons_df, tdf, zone_df, events_df, z_reason
 
