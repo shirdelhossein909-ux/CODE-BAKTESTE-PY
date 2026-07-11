@@ -6,6 +6,9 @@ import numpy as np
 from analysis_distribution import distribution_sheets
 import pandas as pd
 
+# استفاده از M15 برای رفع ابهام داخل کندل (برای مقایسه می‌توانی False کنی)
+USE_M15 = True
+
 # بازه‌ی بک‌تست: در صورت نیاز این دو خط را تغییر بده
 BACKTEST_START = pd.Timestamp("2022-11-22")  # شروع دیتای FXCM
 BACKTEST_END = None  # نمونه: pd.Timestamp("2024-12-31")؛ None یعنی تا انتهای دیتا
@@ -594,7 +597,7 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
 
     # --- آماده‌سازی M15 برای رفع ابهام داخل کندل H4 ---
     m15_t = m15_h = m15_l = None
-    if m15 is not None and not m15.empty:
+    if USE_M15 and m15 is not None and not m15.empty:
         m15_t = m15["time"].values
         m15_h = m15["high"].astype(float).values
         m15_l = m15["low"].astype(float).values
@@ -755,11 +758,15 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
 
         # فیلترها فقط از کندل‌های «بسته‌شده» خوانده می‌شوند (بدون نگاه به آینده):
         # کندل H4 قبلی و آخرین کندل روزانه‌ی کامل‌شده (di-1)
+        # تا وقتی فیلتر رنج «گرم» نشده (۲۰ کندل اول)، معامله ممنوع است
+        if pd.isna(d1["range"].iloc[di-1]) or pd.isna(h4["range"].iloc[i-1]):
+            continue
+
         dtr=int(d1["trend"].iloc[di-1])
         htr=int(h4["trend"].iloc[i-1])
 
-        drg=bool(d1["range"].iloc[di-1]) if not pd.isna(d1["range"].iloc[di-1]) else False
-        hrg=bool(h4["range"].iloc[i-1])  if not pd.isna(h4["range"].iloc[i-1])  else False
+        drg=bool(d1["range"].iloc[di-1])
+        hrg=bool(h4["range"].iloc[i-1])
 
         # بدنه‌ی کندل بسته‌شده‌ی قبلی برای چک لغو هفتگی
         o_prev=float(h4["open"].iloc[i-1]); c_prev=float(h4["close"].iloc[i-1])
