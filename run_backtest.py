@@ -27,10 +27,13 @@ ENTRY_MODES = {
 }
 DEFAULT_ENTRY_OFF = -0.50  # حالت اصلی که گزارش‌های کامل با آن ساخته می‌شود
 
-# مقایسه‌ی نسبت سود به ضرر (RR) — غیرفعال؛ RR نهایی: 3
-COMPARE_RR_MODES = False
+# مقایسه‌ی نسبت سود به ضرر (RR) در یک اجرا — نتایج در شیت «مقایسه_RR»
+COMPARE_RR_MODES = True
 RR_MODES = {
-    "RR=3.0": 3.0,
+    "RR=3": 3.0,
+    "RR=4": 4.0,
+    "RR=5": 5.0,
+    "RR=6": 6.0,
 }
 DEFAULT_RR = 3.0  # حالت اصلی گزارش‌های کامل
 
@@ -994,7 +997,9 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
             "نماد":symbol,"تعداد":0,"درصد_برد":0.0,"فاکتور_سود":0.0,
             "بازده_خالص٪":0.0,"حداکثر_افت٪":0.0,"میانگین_R":0.0,
             "مبهم_تعداد":0,"مبهم_درصد":0.0,
-            "بازده٪_اگر_مبهم_TP":0.0,"بازده٪_اگر_مبهم_استاپ":0.0
+            "بازده٪_اگر_مبهم_TP":0.0,"بازده٪_اگر_مبهم_استاپ":0.0,
+            "فاصله_استاپ_پیپ":0.0,"فاصله_TP_پیپ":0.0,
+            "برد_همان_کندل_تعداد":0,"بازده٪_اگر_برد_همان_کندل_استاپ":0.0
         }
     else:
         wins=tdf.loc[tdf["نتیجه_R"]>0,"نتیجه_R"].sum()
@@ -1019,12 +1024,33 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
         net_if_tp = _net_with(rs_if_tp)      # اگر همه‌ی مبهم‌ها TP بودند
         net_if_sl = _net_with(tdf["نتیجه_R"])  # مبهم‌ها همین حالا استاپ حساب شده‌اند
 
+        # --- فاصله‌ی استاپ و حدسود به پیپ ---
+        if symbol.endswith("JPY"):
+            pip = 0.01
+        elif symbol == "XAUUSD":
+            pip = 0.1
+        elif symbol == "XAGUSD":
+            pip = 0.01
+        else:
+            pip = 0.0001
+        sl_pips = float(((tdf["ورود"] - tdf["حدضرر"]).abs() / pip).mean())
+        tp_pips = float(((tdf["حدسود"] - tdf["ورود"]).abs() / pip).mean())
+
+        # --- بردهای همان‌کندل (خروج در همان کندل ورود) و سناریوی کف: همه استاپ ---
+        same_win = (pd.to_datetime(tdf["زمان_ورود"]) == pd.to_datetime(tdf["زمان_خروج"])) & (tdf["نتیجه_R"] > 0)
+        n_sw = int(same_win.sum())
+        r_if_sl = -1.0 - commission_cost / risk_d
+        rs_floor = tdf["نتیجه_R"].where(~same_win, r_if_sl).fillna(tdf["نتیجه_R"])
+        net_floor = _net_with(rs_floor)
+
         metrics={
             "نماد":symbol,"تعداد":int(len(tdf)),"درصد_برد":round(winrate,2),
             "فاکتور_سود":round(pf,3),"بازده_خالص٪":round(net,2),
             "حداکثر_افت٪":round(max_dd*100.0,2),"میانگین_R":round(float(tdf["نتیجه_R"].mean()),3),
             "مبهم_تعداد":n_amb,"مبهم_درصد":round(n_amb/len(tdf)*100.0,2),
-            "بازده٪_اگر_مبهم_TP":net_if_tp,"بازده٪_اگر_مبهم_استاپ":net_if_sl
+            "بازده٪_اگر_مبهم_TP":net_if_tp,"بازده٪_اگر_مبهم_استاپ":net_if_sl,
+            "فاصله_استاپ_پیپ":round(sl_pips,1),"فاصله_TP_پیپ":round(tp_pips,1),
+            "برد_همان_کندل_تعداد":n_sw,"بازده٪_اگر_برد_همان_کندل_استاپ":net_floor
         }
 
     reasons_df=pd.DataFrame([{"نماد":symbol,"دلیل":k,"تعداد":int(v)} for k,v in reasons.items()])
@@ -1428,7 +1454,7 @@ def main():
         base=os.path.basename(zp)
         symbol = base.split(".")[0]  # e.g. USDJPY.W.D.H4.zip => USDJPY
         h4,d1,w1,m15 = load_timeframes_from_zip(zp)
-        if m15 is None:
+        if m15 is None and USE_M15:
             print(f"⚠️ {symbol}: فایل M15 داخل ZIP نیست؛ ابهام‌های داخل کندل بدبینانه (استاپ) حساب می‌شود.")
         if not h4.empty:
             end_t = pd.to_datetime(h4["time"].max(), errors="coerce")
@@ -1640,7 +1666,9 @@ def main():
 
         summary_cols = [
             "نماد", "درصد_برد", "درصد_لاس", "بازده_خالص٪", "میانگین_R", "حداکثر_افت٪", "فاکتور_سود", "تعداد",
-            "مبهم_تعداد", "مبهم_درصد", "بازده٪_اگر_مبهم_TP", "بازده٪_اگر_مبهم_استاپ"
+            "مبهم_تعداد", "مبهم_درصد", "بازده٪_اگر_مبهم_TP", "بازده٪_اگر_مبهم_استاپ",
+            "فاصله_استاپ_پیپ", "فاصله_TP_پیپ",
+            "برد_همان_کندل_تعداد", "بازده٪_اگر_برد_همان_کندل_استاپ"
         ]
         for c in summary_cols:
             if c not in summary_df.columns:
