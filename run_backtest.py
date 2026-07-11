@@ -6,9 +6,9 @@ import numpy as np
 from analysis_distribution import distribution_sheets
 import pandas as pd
 
-# بازه‌ی بک‌تست: برای تست خارج از نمونه (مثلاً ۲۰۱۹ تا ۲۰۲۲) این دو خط را تغییر بده
-BACKTEST_START = pd.Timestamp("2023-01-01")
-BACKTEST_END = None  # نمونه: pd.Timestamp("2022-12-31")؛ None یعنی تا انتهای دیتا
+# بازه‌ی بک‌تست: در صورت نیاز این دو خط را تغییر بده
+BACKTEST_START = pd.Timestamp("2022-11-22")  # شروع دیتای FXCM
+BACKTEST_END = None  # نمونه: pd.Timestamp("2024-12-31")؛ None یعنی تا انتهای دیتا
 
 # هزینه‌های معاملاتی تقریبی (نسبت به اسپرد هر نماد؛ در صورت نیاز این دو عدد را ویرایش کن)
 COMMISSION_SPREAD_MULT = 0.5       # کمیسیون رفت‌وبرگشت ≈ نصف اسپرد
@@ -112,28 +112,85 @@ def wrap_text(s: str, max_chars=80):
     return lines
 
 # ------------- CSV reader (MetaTrader no header) -------------
+def _smart_dt(d, t=None):
+    """تبدیل تاریخ به datetime با تشخیص خودکار ترتیب روز/ماه (برای فرمت‌های مختلف بروکرها)."""
+    s = d.astype(str).str.strip()
+    if t is not None:
+        s = s + " " + t.astype(str).str.strip()
+    samp = s.head(500).str.extract(r"^(\d{1,4})[./-](\d{1,2})[./-](\d{1,4})")
+    dayfirst = False
+    try:
+        first = pd.to_numeric(samp[0], errors="coerce")
+        if first.notna().any() and first.max() <= 31 and (first > 12).any():
+            dayfirst = True
+    except Exception:
+        pass
+    return pd.to_datetime(s, errors="coerce", dayfirst=dayfirst)
+
+
 def read_mt_csv_from_bytes(b: bytes) -> pd.DataFrame:
+    """خواندن CSV قیمت با تشخیص خودکار فرمت:
+    - متاتریدر بدون سطر عنوان (date,time,o,h,l,c[,v])
+    - فایل‌های دارای سطر عنوان (مثل FXCM): ستون‌های Open/High/Low/Close یا BidOpen/BidHigh/...
+      و تاریخ به‌صورت دو ستون Date/Time یا یک ستون DateTime"""
     if b is None or len(b) == 0:
         raise ValueError("فایل CSV خالی است.")
 
-    df = pd.read_csv(io.BytesIO(b), header=None)
-    # Date, Time, Open, High, Low, Close, Volume
-    if df.shape[1] < 6:
-        raise ValueError("فرمت CSV غیرمنتظره است (ستون کم).")
-    if df.shape[1] >= 7:
-        df = df.iloc[:, :7]
-        df.columns = ["date", "time", "open", "high", "low", "close", "volume"]
-    else:
-        df = df.iloc[:, :6]
-        df.columns = ["date", "time", "open", "high", "low", "close"]
+    head = b[:2048].decode("utf-8", "ignore")
+    first_line = head.splitlines()[0].lower() if head else ""
+    has_header = any(k in first_line for k in ("open", "high", "low", "close"))
 
-    df["time"] = pd.to_datetime(
-        df["date"].astype(str).str.strip() + " " + df["time"].astype(str).str.strip(),
-        errors="coerce"
-    )
-    df = df.dropna(subset=["time"]).sort_values("time").drop_duplicates("time").reset_index(drop=True)
-    df = df[["time", "open", "high", "low", "close"]].copy()
-    return df
+    if has_header:
+        df = pd.read_csv(io.BytesIO(b))
+        df.columns = [str(c).strip().lower().replace(" ", "") for c in df.columns]
+
+        def pick(*names):
+            for nm in names:
+                if nm in df.columns:
+                    return df[nm]
+            return None
+
+        o = pick("open", "bidopen"); h = pick("high", "bidhigh")
+        l = pick("low", "bidlow");   c = pick("close", "bidclose")
+        if o is None or h is None or l is None or c is None:
+            raise ValueError("ستون‌های قیمت (Open/High/Low/Close یا BidOpen/...) پیدا نشد.")
+
+        dcol = pick("date"); tcol = pick("time", "datetime", "timestamp", "gmttime")
+        if dcol is not None and tcol is not None:
+            tser = _smart_dt(dcol, tcol)
+        elif dcol is not None:
+            tser = _smart_dt(dcol)
+        elif tcol is not None:
+            tser = _smart_dt(tcol)
+        else:
+            tser = _smart_dt(df.iloc[:, 0])
+    else:
+        df = pd.read_csv(io.BytesIO(b), header=None)
+        if df.shape[1] < 5:
+            raise ValueError("فرمت CSV غیرمنتظره است (ستون کم).")
+        c1 = pd.to_numeric(df.iloc[:, 1], errors="coerce")
+        if c1.notna().mean() > 0.9:
+            # ستون اول تاریخ+ساعت یکجا است
+            tser = _smart_dt(df.iloc[:, 0])
+            o, h, l, c = (df.iloc[:, k] for k in (1, 2, 3, 4))
+        else:
+            # فرمت کلاسیک متاتریدر: date,time,o,h,l,c
+            if df.shape[1] < 6:
+                raise ValueError("فرمت CSV غیرمنتظره است (ستون کم).")
+            tser = _smart_dt(df.iloc[:, 0], df.iloc[:, 1])
+            o, h, l, c = (df.iloc[:, k] for k in (2, 3, 4, 5))
+
+    out = pd.DataFrame({
+        "time": tser,
+        "open": pd.to_numeric(o, errors="coerce"),
+        "high": pd.to_numeric(h, errors="coerce"),
+        "low":  pd.to_numeric(l, errors="coerce"),
+        "close": pd.to_numeric(c, errors="coerce"),
+    })
+    out = out.dropna().sort_values("time").drop_duplicates("time").reset_index(drop=True)
+    if out.empty:
+        raise ValueError("هیچ سطر معتبری در CSV پیدا نشد (فرمت ناشناخته).")
+    return out
 
 def load_timeframes_from_zip(zip_path: str):
     if not os.path.exists(zip_path):
