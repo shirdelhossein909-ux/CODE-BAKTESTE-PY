@@ -36,7 +36,9 @@ BASKET = ["AUDJPY", "AUDUSD", "CHFJPY", "EURCAD", "EURNZD", "GBPJPY",
 
 RISK_PER_TRADE = 0.005    # ریسک هر معامله: نیم درصد از اکویتی
 RESERVE = 0.15            # سرمایه‌ی رزرو (مثل بک‌تست)
-MAX_OPEN_TOTAL = 5        # سقف پوزیشن باز هم‌زمان کل حساب
+MAX_OPEN_TOTAL = 5        # سقف تریدهای باز هم‌زمان کل حساب — پر شود، اوردرهای در انتظار موقتاً جمع می‌شوند
+MAX_PENDING_TOTAL = 8     # سقف کل اوردرهای در انتظار روی کل حساب (هر نماد حداکثر ۳ — در خود موتور)
+MAX_RISK_HARD_CAP = 0.01  # قفل ایمنی: ریسک واقعی هیچ معامله‌ای از ۱٪ اکویتی بیشتر نشود
 ENTRY_OFF = -0.50         # ورود وسط زون (مثل بک‌تست)
 RR = 3.0                  # حد سود = ۳ برابر ریسک
 
@@ -180,18 +182,35 @@ def replay_state(base, broker_name):
 
 
 # ---------------- سفارش‌گذاری ----------------
-def calc_volume(si, risk_amt, risk_dist):
-    """حجم از روی ریسک ثابت: مبلغ ریسک ÷ ضررِ هر لات در فاصله‌ی استاپ."""
-    if risk_dist <= 0 or si.trade_tick_size <= 0 or si.trade_tick_value <= 0:
-        return None
-    loss_per_lot = risk_dist / si.trade_tick_size * si.trade_tick_value
-    if loss_per_lot <= 0:
-        return None
-    vol = risk_amt / loss_per_lot
+def calc_volume(broker_name, si, direction, entry, sl, risk_amt, equity):
+    """حجم از روی ریسک ثابت — محاسبه‌ی ضرر با تابع رسمی خود متاتریدر (order_calc_profit)
+    که برای هر نمادی (طلا، ین، ...) مشخصات قرارداد همان بروکر را دقیق حساب می‌کند.
+    + قفل ایمنی دوبل: ریسک واقعی حجم نهایی دوباره چک می‌شود."""
+    order_type = mt5.ORDER_TYPE_BUY if direction == "BUY" else mt5.ORDER_TYPE_SELL
+
+    loss_1lot = mt5.order_calc_profit(order_type, broker_name, 1.0, entry, sl)
+    if loss_1lot is None or loss_1lot >= 0:
+        return None, "متاتریدر ضررِ یک لات را حساب نکرد"
+    loss_1lot = abs(loss_1lot)
+
+    vol = risk_amt / loss_1lot
     step = si.volume_step or 0.01
     vol = math.floor(vol / step) * step
-    vol = max(si.volume_min, min(vol, si.volume_max))
-    return round(vol, 8)
+    if vol < si.volume_min:
+        return None, f"حجم لازم ({vol}) از حداقل مجاز نماد ({si.volume_min}) کمتر است"
+    vol = min(vol, si.volume_max)
+    vol = round(vol, 8)
+
+    # قفل ایمنی دوبل: ریسک واقعی این حجم چقدر است؟
+    real_loss = mt5.order_calc_profit(order_type, broker_name, vol, entry, sl)
+    if real_loss is None:
+        return None, "چک نهایی ریسک ممکن نشد"
+    real_loss = abs(real_loss)
+    if real_loss > risk_amt * 1.2:
+        return None, f"ریسک واقعی ({real_loss:,.0f}$) از حد مجاز ({risk_amt:,.0f}$) بیشتر شد — سفارش رد شد"
+    if real_loss > equity * MAX_RISK_HARD_CAP:
+        return None, f"ریسک واقعی ({real_loss:,.0f}$) از قفل ایمنی {MAX_RISK_HARD_CAP*100:g}٪ حساب بیشتر است — سفارش رد شد"
+    return vol, f"ریسک واقعی {real_loss:,.0f}$"
 
 
 def place_pending(base, broker_name, p):
@@ -214,10 +233,10 @@ def place_pending(base, broker_name, p):
         return
 
     risk_amt = acc.equity * (1.0 - RESERVE) * RISK_PER_TRADE
-    vol = calc_volume(si, risk_amt, abs(entry - sl))
+    vol, vol_msg = calc_volume(broker_name, si, p["direction"], entry, sl, risk_amt, acc.equity)
     if vol is None:
-        log(f"⚠️ زون {p['zone_id']}: محاسبه‌ی حجم ممکن نشد — سفارش گذاشته نشد.", base)
-        return
+        log(f"⚠️ زون {p['zone_id']}: سفارش گذاشته نشد — {vol_msg}", base)
+        return False
 
     req = {
         "action": mt5.TRADE_ACTION_PENDING,
@@ -234,14 +253,16 @@ def place_pending(base, broker_name, p):
     side = "خرید" if p["direction"] == "BUY" else "فروش"
     if res is None:
         log(f"❌ زون {p['zone_id']}: پاسخ ارسال سفارش نیامد: {mt5.last_error()}", base)
-        return
+        return False
     if res.retcode == mt5.TRADE_RETCODE_DONE:
-        log(f"🟢 سفارش {side} گذاشته شد | زون {p['zone_id']} | حجم {vol} لات | "
+        log(f"🟢 سفارش {side} گذاشته شد | زون {p['zone_id']} | حجم {vol} لات ({vol_msg}) | "
             f"ورود {entry} | استاپ {sl} | تارگت {tp} | تیکت {res.order}", base)
+        return True
     elif res.retcode == 10018:
         log(f"🌙 بازار بسته است — سفارش زون {p['zone_id']} بعداً گذاشته می‌شود.", base)
     else:
         log(f"❌ سفارش زون {p['zone_id']} رد شد | کد {res.retcode} | {res.comment}", base)
+    return False
 
 
 def cancel_order(base, o, why="طبق قوانین استراتژی دیگر معتبر نیست"):
@@ -270,16 +291,21 @@ def sync_symbol(base, broker_name):
         if cm not in desired:
             cancel_order(base, o)
 
-    # ۲) گذاشتن سفارش‌های جدید (با رعایت سقف کل)
+    # ۲) گذاشتن سفارش‌های جدید (با رعایت سقف‌های کل حساب)
     placed_something = False
+    pending_total = len([o for o in (mt5.orders_get() or ()) if o.magic == MAGIC])
     for zid, p in desired.items():
         if zid in existing:
             continue
         if len(my_positions) >= MAX_OPEN_TOTAL:
-            log(f"⏸️ زون {zid}: سقف {MAX_OPEN_TOTAL} پوزیشن باز حساب پر است — فعلاً سفارش جدید نمی‌گذارم.", base)
+            log(f"⏸️ زون {zid}: سقف {MAX_OPEN_TOTAL} ترید باز حساب پر است — فعلاً سفارش جدید نمی‌گذارم.", base)
             continue
-        place_pending(base, broker_name, p)
-        placed_something = True
+        if pending_total >= MAX_PENDING_TOTAL:
+            log(f"⏸️ زون {zid}: سقف {MAX_PENDING_TOTAL} اوردر در انتظار کل حساب پر است — گذاشته نشد.", base)
+            continue
+        if place_pending(base, broker_name, p):
+            pending_total += 1
+            placed_something = True
 
     # ۳) گزارش وضعیت با دلیل — که همیشه بدانیم چرا معامله هست یا نیست
     if not desired:
@@ -287,6 +313,32 @@ def sync_symbol(base, broker_name):
         log(f"معامله‌ای لازم نیست. دلیل: یا زون تازه‌ای نزدیک قیمت نیست، یا فیلترها اجازه نمی‌دهند ({why})", base)
     elif not placed_something:
         log(f"وضعیت بدون تغییر | سفارش‌های فعال این نماد: {len(existing)}", base)
+
+
+# ---------------- سقف تریدهای باز: پر شد → اوردرها موقتاً جمع می‌شوند ----------------
+_cap_active = False
+
+def enforce_open_cap(symbols_rev):
+    """اگر تعداد تریدهای باز به سقف رسید، همه‌ی اوردرهای در انتظار جمع می‌شوند؛
+    وقتی دوباره زیر سقف آمد، اعلام می‌کند تا اوردرها دوباره چیده شوند."""
+    global _cap_active
+    my_open = [p for p in (mt5.positions_get() or ()) if p.magic == MAGIC]
+    my_orders = [o for o in (mt5.orders_get() or ()) if o.magic == MAGIC]
+
+    if len(my_open) >= MAX_OPEN_TOTAL:
+        if my_orders:
+            log(f"🚧 سقف {MAX_OPEN_TOTAL} ترید باز پر شد — {len(my_orders)} اوردر در انتظار موقتاً جمع می‌شود.")
+            for o in my_orders:
+                cancel_order(symbols_rev.get(o.symbol, o.symbol), o,
+                             why=f"سقف {MAX_OPEN_TOTAL} ترید باز پر است (بعداً دوباره چیده می‌شود)")
+        _cap_active = True
+        return "capped"
+
+    if _cap_active:
+        _cap_active = False
+        log(f"✅ تعداد تریدهای باز زیر {MAX_OPEN_TOTAL} برگشت — اوردرها دوباره چیده می‌شوند.")
+        return "resync"
+    return "ok"
 
 
 # ---------------- رصد پر شدن و بسته شدن معاملات ----------------
@@ -362,6 +414,14 @@ def main():
     while True:
         try:
             ensure_connected()
+
+            cap_state = enforce_open_cap(symbols_rev)
+            if cap_state == "resync":
+                for b, name in symbols.items():
+                    try:
+                        sync_symbol(b, name)
+                    except Exception as e:
+                        log(f"❌ خطا در چیدن دوباره‌ی اوردرها: {e}", b)
 
             for b, name in symbols.items():
                 try:
