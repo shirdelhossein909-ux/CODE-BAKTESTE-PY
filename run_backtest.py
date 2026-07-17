@@ -62,6 +62,16 @@ PORTFOLIO_MAX_OPEN = 5              # حداکثر پوزیشن باز هم‌ز
 PORTFOLIO_RISK_PER_TRADE = 0.005    # ریسک هر معامله از اکویتی حساب (0.005 = نیم درصد، 0.01 = یک درصد)
 PORTFOLIO_SYMBOLS = []              # خالی = همه‌ی نمادها؛ نمونه: ["AUDCAD","EURUSD","CHFJPY","XAUUSD","GBPCAD"]
 
+# مقایسه‌ی «محدودیت ضرر» (سپر ایمنی حساب): بعد از N ضرر در روز/هفته،
+# ورود جدید ممنوع تا روز/هفته‌ی بعد. نتایج در شیت «مقایسه_محدودیت_ضرر»
+COMPARE_LOSSLIMIT_MODES = True
+LOSSLIMIT_MODES = {
+    "بدون محدودیت": (0, 0),
+    "3 ضرر روز / 7 هفته": (3, 7),
+    "2 ضرر روز / 5 هفته": (2, 5),
+    "3 ضرر روز / 5 هفته": (3, 5),
+}
+
 # (خروجی PDF/ژورنال در نسخه 1.9 تولید نمی‌شود)
 # این وابستگی‌ها اختیاری هستند؛ اگر نصب نبودند، بک‌تست همچنان اجرا می‌شود.
 canvas = None
@@ -1434,7 +1444,7 @@ def _aggregate_mode_rows(rows, mode_col):
     return out.sort_values([mode_col, "نماد"]).reset_index(drop=True)
 
 def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_trade=None,
-                     max_open=None, symbols=None):
+                     max_open=None, symbols=None, max_losses_day=0, max_losses_week=0):
     """شبیه‌سازی «یک حساب مشترک» روی معاملات همه‌ی نمادها:
     معامله‌ها به ترتیب زمان ورود اجرا می‌شوند، ریسک هر معامله ۱٪ از اکویتی لحظه‌ای حساب است،
     و اگر تعداد پوزیشن‌های باز به سقف برسد، معامله‌ی جدید گرفته نمی‌شود (رد می‌شود).
@@ -1459,13 +1469,17 @@ def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_tr
     if risk_per_trade is None:
         risk_per_trade = PORTFOLIO_RISK_PER_TRADE
 
+    from collections import deque
+
     eq = float(start_equity); peak = eq; max_dd = 0.0
     open_heap = []   # (زمان_خروج, ردیف, مبلغ_ریسک, R)
     curve = []
     taken = skipped = 0
+    skipped_losslimit = 0
     win_amt = loss_amt = 0.0
     rs = []
     seq = 0
+    loss_times = deque()  # زمان بسته شدن ضررها (برای محدودیت روز/هفته)
 
     def close_until(t_now):
         nonlocal eq, peak, max_dd, win_amt, loss_amt
@@ -1474,7 +1488,9 @@ def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_tr
             pnl = ramt * r
             eq += pnl
             if pnl > 0: win_amt += pnl
-            else: loss_amt += -pnl
+            else:
+                loss_amt += -pnl
+                loss_times.append(xt)
             rs.append(r)
             peak = max(peak, eq)
             dd = (peak - eq) / peak if peak > 0 else 0.0
@@ -1486,6 +1502,27 @@ def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_tr
         if len(open_heap) >= max_open:
             skipped += 1
             continue
+
+        # سپر ایمنی: بعد از N ضرر در روز/هفته، ورود جدید ممنوع تا دوره عوض شود
+        if max_losses_day or max_losses_week:
+            cutoff = entry_t - pd.Timedelta(days=8)
+            while loss_times and loss_times[0] < cutoff:
+                loss_times.popleft()
+            blocked = False
+            if max_losses_day:
+                ld = sum(1 for lt in loss_times if lt.date() == entry_t.date())
+                if ld >= max_losses_day:
+                    blocked = True
+            if not blocked and max_losses_week:
+                iso = entry_t.isocalendar()
+                lw = sum(1 for lt in loss_times
+                         if lt.isocalendar()[0] == iso[0] and lt.isocalendar()[1] == iso[1])
+                if lw >= max_losses_week:
+                    blocked = True
+            if blocked:
+                skipped_losslimit += 1
+                continue
+
         ramt = eq * (1.0 - reserve) * risk_per_trade
         seq += 1
         heapq.heappush(open_heap, (exit_t, seq, ramt, float(r)))
@@ -1499,6 +1536,7 @@ def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_tr
         "ریسک_هر_معامله٪": round(risk_per_trade * 100.0, 2),
         "معاملات_انجام‌شده": int(taken),
         "معاملات_ردشده_به_خاطر_سقف": int(skipped),
+        "ردشده_محدودیت_ضرر": int(skipped_losslimit),
         "درصد_برد": round(wins / len(rs) * 100.0, 2) if rs else 0.0,
         "فاکتور_سود": round(win_amt / loss_amt, 3) if loss_amt > 0 else 999.0,
         "بازده_خالص٪": round((eq - start_equity) / start_equity * 100.0, 2),
@@ -1843,6 +1881,28 @@ def main():
         except Exception as e:
             print("⚠️ شبیه‌سازی پرتفوی ناموفق بود:", str(e))
 
+        # --- مقایسه‌ی محدودیت‌های ضرر (سپر ایمنی) روی همان حساب مشترک ---
+        ll_out = None
+        if COMPARE_LOSSLIMIT_MODES:
+            try:
+                ll_rows = []
+                for label, (ld, lw) in LOSSLIMIT_MODES.items():
+                    pr = portfolio_replay(trades_df, symbols=(PORTFOLIO_SYMBOLS or None),
+                                          max_losses_day=ld, max_losses_week=lw)
+                    if pr is None:
+                        continue
+                    s = pr["stats"].copy()
+                    s.insert(0, "محدودیت", label)
+                    # بدترین ماه هر حالت هم برای قضاوت مهم است
+                    m = pr["monthly"]
+                    s["بدترین_ماه٪"] = round(float(m["بازده٪"].min()), 2) if not m.empty else 0.0
+                    s["ماه‌های_منفی"] = int((m["بازده٪"] < 0).sum()) if not m.empty else 0
+                    ll_rows.append(s)
+                if ll_rows:
+                    ll_out = pd.concat(ll_rows, ignore_index=True)
+            except Exception as e:
+                print("⚠️ مقایسه‌ی محدودیت ضرر ناموفق بود:", str(e))
+
         with pd.ExcelWriter(summary_path, engine="openpyxl") as sw:
             summary_out.to_excel(sw, sheet_name="خلاصه", index=False)
             if cmp_out is not None:
@@ -1857,6 +1917,8 @@ def main():
                 port["stats"].to_excel(sw, sheet_name="پرتفوی", index=False)
                 port["yearly"].to_excel(sw, sheet_name="پرتفوی_سالانه", index=False)
                 port["monthly"].to_excel(sw, sheet_name="پرتفوی_ماهانه", index=False)
+            if ll_out is not None:
+                ll_out.to_excel(sw, sheet_name="مقایسه_محدودیت_ضرر", index=False)
 
         # --- خروجی نهایی (جزئیات کامل) ---
         with pd.ExcelWriter(detailed_path, engine="openpyxl") as writer:
