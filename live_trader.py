@@ -22,8 +22,10 @@
 import os
 import sys
 import math
+import json
 import time as _time
 import datetime as dt
+import urllib.request
 
 import pandas as pd
 
@@ -51,6 +53,10 @@ W1_BARS = 300
 MAGIC = 777001            # امضای سفارش‌های این ربات
 ALLOW_REAL = False        # قفل ایمنی: فقط حساب دمو
 LOG_DIR = "logs"          # پوشه‌ی لاگ، کنار همین فایل ساخته می‌شود
+
+# --- خبررسانی به پیام‌رسان «بله» ---
+BALE_TOKEN = ""           # توکن رباتی که در بله ساختی (خالی = خبررسانی خاموش)
+BALE_CHAT_ID = ""         # خالی بگذار تا خودش پیدا کند (فقط اول یک پیام به ربات بله‌ات بده)
 # =============================================
 
 # بازپخش لایو باید کل پنجره‌ی دیتا را ببیند (بدون برش تاریخ بک‌تست)
@@ -68,6 +74,9 @@ except ImportError:
 # ---------------- لاگ و ضربان قلب ----------------
 os.makedirs(LOG_DIR, exist_ok=True)
 
+# رویدادهای مهمی که علاوه بر لاگ، به گوشی (بله) هم فرستاده می‌شوند
+_BALE_MARKERS = ("🟢", "🎯", "🏁", "🚨", "🚧", "🛑", "✅ اتصال")
+
 def log(msg, symbol=""):
     stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{stamp}] {symbol + ' | ' if symbol else ''}{msg}"
@@ -78,6 +87,51 @@ def log(msg, symbol=""):
             f.write(line + "\n")
     except Exception:
         pass
+    if any(k in msg for k in _BALE_MARKERS):
+        bale_send(line)
+
+
+# ---------------- خبررسانی به بله ----------------
+_bale_chat_id = None
+_bale_fail_logged = False
+
+def _bale_detect_chat():
+    """اگر چت‌آیدی تنظیم نشده باشد، از آخرین پیامی که به ربات بله داده‌ای پیدایش می‌کند."""
+    try:
+        with urllib.request.urlopen(
+                f"https://tapi.bale.ai/bot{BALE_TOKEN}/getUpdates", timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        for u in reversed(data.get("result", [])):
+            chat = (u.get("message") or {}).get("chat") or {}
+            if chat.get("id"):
+                print(f"[بله] چت‌آیدی شناسایی شد: {chat['id']} — برای اطمینان همین را در BALE_CHAT_ID بگذار.")
+                return str(chat["id"])
+        print("[بله] هنوز پیامی به ربات بله‌ات نداده‌ای — اول در بله به رباتت «سلام» بفرست.")
+    except Exception as e:
+        print(f"[بله] شناسایی چت‌آیدی ناموفق: {e}")
+    return None
+
+
+def bale_send(text):
+    """ارسال پیام به بله؛ اگر نشد، ربات را متوقف نمی‌کند (فقط یک بار در لاگ می‌گوید)."""
+    global _bale_chat_id, _bale_fail_logged
+    if not BALE_TOKEN:
+        return
+    try:
+        if _bale_chat_id is None:
+            _bale_chat_id = BALE_CHAT_ID or _bale_detect_chat()
+        if not _bale_chat_id:
+            return
+        data = json.dumps({"chat_id": _bale_chat_id, "text": text}).encode("utf-8")
+        req = urllib.request.Request(
+            f"https://tapi.bale.ai/bot{BALE_TOKEN}/sendMessage",
+            data=data, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+        _bale_fail_logged = False
+    except Exception as e:
+        if not _bale_fail_logged:
+            _bale_fail_logged = True
+            print(f"[بله] ارسال پیام ناموفق ({e}) — ربات به کارش ادامه می‌دهد.")
 
 def heartbeat(status="سالم"):
     try:
@@ -466,18 +520,28 @@ def main():
             log(f"❌ خطا در بررسی اولیه: {e}", b)
 
     log("در حال کار... با هر کندل ۴ ساعته‌ی جدید همه‌چیز به‌روز می‌شود. (توقف: Ctrl+C)")
+    _last_problems = [set()]
     while True:
         try:
             ensure_connected()
 
-            # سلامت‌سنجی هر دور: مشکلی باشد، بلند داد می‌زند (هم CMD هم فایل)
+            # سلامت‌سنجی هر دور: مشکل جدید → داد بلند (لاگ + بله)؛ مشکل تکراری → فقط CMD
             problems = health_check()
             if problems:
-                for pr in problems:
-                    log(f"🚨 {pr}")
+                pset = set(problems)
+                if pset != _last_problems[0]:
+                    for pr in problems:
+                        log(f"🚨 {pr}")
+                    _last_problems[0] = pset
+                else:
+                    for pr in problems:
+                        console(f"🚨 {pr}")
                 heartbeat("مشکل: " + " | ".join(problems))
                 _time.sleep(POLL_SECONDS)
                 continue
+            elif _last_problems[0]:
+                _last_problems[0] = set()
+                log("🟢 مشکل برطرف شد — همه‌چیز دوباره سالم است و ربات ادامه می‌دهد.")
 
             cap_state = enforce_open_cap(symbols_rev)
             if cap_state == "resync":
