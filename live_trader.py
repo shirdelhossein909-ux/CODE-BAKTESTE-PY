@@ -89,8 +89,11 @@ def log(msg, symbol=""):
 
 
 # ---------------- خبررسانی به بله ----------------
+from collections import deque
+
 _bale_chat_id = None
 _bale_fail_logged = False
+_bale_queue = deque(maxlen=500)  # پیام‌های نرفته نگه داشته می‌شوند تا ارتباط برگردد
 
 def _bale_detect_chat():
     """اگر چت‌آیدی تنظیم نشده باشد، از آخرین پیامی که به ربات بله داده‌ای پیدایش می‌کند."""
@@ -110,25 +113,39 @@ def _bale_detect_chat():
 
 
 def bale_send(text):
-    """ارسال پیام به بله؛ اگر نشد، ربات را متوقف نمی‌کند (فقط یک بار در لاگ می‌گوید)."""
-    global _bale_chat_id, _bale_fail_logged
+    """پیام را در صف می‌گذارد و تلاش می‌کند صف را بفرستد؛ نرفته‌ها گم نمی‌شوند."""
     if not BALE_TOKEN:
         return
-    try:
-        if _bale_chat_id is None:
-            _bale_chat_id = BALE_CHAT_ID or _bale_detect_chat()
-        if not _bale_chat_id:
-            return
-        data = json.dumps({"chat_id": _bale_chat_id, "text": text}).encode("utf-8")
-        req = urllib.request.Request(
-            f"https://tapi.bale.ai/bot{BALE_TOKEN}/sendMessage",
-            data=data, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=10)
-        _bale_fail_logged = False
-    except Exception as e:
-        if not _bale_fail_logged:
-            _bale_fail_logged = True
-            print(f"[بله] ارسال پیام ناموفق ({e}) — ربات به کارش ادامه می‌دهد.")
+    _bale_queue.append(text)
+    bale_flush()
+
+
+def bale_flush():
+    """ارسال پیام‌های مانده در صف، به ترتیب؛ اگر ارتباط نبود، صف می‌ماند برای بعد."""
+    global _bale_chat_id, _bale_fail_logged
+    if not BALE_TOKEN or not _bale_queue:
+        return
+    if _bale_chat_id is None:
+        _bale_chat_id = BALE_CHAT_ID or _bale_detect_chat()
+    if not _bale_chat_id:
+        return
+    while _bale_queue:
+        txt = _bale_queue[0]
+        try:
+            data = json.dumps({"chat_id": _bale_chat_id, "text": txt}).encode("utf-8")
+            req = urllib.request.Request(
+                f"https://tapi.bale.ai/bot{BALE_TOKEN}/sendMessage",
+                data=data, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=5)
+            _bale_queue.popleft()
+            if _bale_fail_logged:
+                _bale_fail_logged = False
+                print("[بله] ارتباط با بله برگشت — پیام‌های مانده ارسال شدند.")
+        except Exception as e:
+            if not _bale_fail_logged:
+                _bale_fail_logged = True
+                print(f"[بله] ارسال فعلاً ناموفق ({e}) — {len(_bale_queue)} پیام در صف می‌ماند و بعداً می‌رود.")
+            break
 
 def heartbeat(status="سالم"):
     try:
@@ -563,6 +580,7 @@ def main():
 
             track_positions(symbols_rev)
             report_status()
+            bale_flush()  # پیام‌های مانده در صف بله، هر دور دوباره تلاش می‌شوند
             heartbeat("سالم")
             _time.sleep(POLL_SECONDS)
 
