@@ -62,9 +62,20 @@ PORTFOLIO_MAX_OPEN = 5              # حداکثر پوزیشن باز هم‌ز
 PORTFOLIO_RISK_PER_TRADE = 0.005    # ریسک هر معامله از اکویتی حساب (0.005 = نیم درصد، 0.01 = یک درصد)
 PORTFOLIO_SYMBOLS = []              # خالی = همه‌ی نمادها؛ نمونه: ["AUDCAD","EURUSD","CHFJPY","XAUUSD","GBPCAD"]
 
-# مقایسه‌ی «محدودیت ضرر» (سپر ایمنی حساب): بعد از N ضرر در روز/هفته،
-# ورود جدید ممنوع تا روز/هفته‌ی بعد. نتایج در شیت «مقایسه_محدودیت_ضرر»
-COMPARE_LOSSLIMIT_MODES = True
+# فایل «جزئیات_حرفه‌ای.xlsx» ساخته بشود یا نه (False = فقط خلاصه؛ سریع‌تر)
+WRITE_DETAILS = False
+
+# مقایسه‌ی «سقف اجرا» (شبیه ربات لایو): هر چارت حداکثر ۱ ترید باز + سقف کل.
+# نتایج در شیت «مقایسه_سقف_اجرا»
+COMPARE_EXECCAP_MODES = True
+EXECCAP_MODES = {
+    "بدون محدودیت": (0, 0),          # (سقف کل تریدهای باز, سقف هر چارت)
+    "هر چارت 1 + سقف 3": (3, 1),
+    "هر چارت 1 + سقف 5": (5, 1),
+}
+
+# مقایسه‌ی «محدودیت ضرر» — نتیجه: کمکی نکرد (فقط سود کمتر)؛ بدون محدودیت می‌مانیم
+COMPARE_LOSSLIMIT_MODES = False
 LOSSLIMIT_MODES = {
     "بدون محدودیت": (0, 0),
     "3 ضرر روز / 7 هفته": (3, 7),
@@ -1444,7 +1455,8 @@ def _aggregate_mode_rows(rows, mode_col):
     return out.sort_values([mode_col, "نماد"]).reset_index(drop=True)
 
 def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_trade=None,
-                     max_open=None, symbols=None, max_losses_day=0, max_losses_week=0):
+                     max_open=None, symbols=None, max_losses_day=0, max_losses_week=0,
+                     per_symbol_max_open=0):
     """شبیه‌سازی «یک حساب مشترک» روی معاملات همه‌ی نمادها:
     معامله‌ها به ترتیب زمان ورود اجرا می‌شوند، ریسک هر معامله ۱٪ از اکویتی لحظه‌ای حساب است،
     و اگر تعداد پوزیشن‌های باز به سقف برسد، معامله‌ی جدید گرفته نمی‌شود (رد می‌شود).
@@ -1466,6 +1478,7 @@ def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_tr
         return None
     if max_open is None:
         max_open = PORTFOLIO_MAX_OPEN
+    open_cap = max_open if (max_open and max_open > 0) else 10**9  # 0 = بدون سقف
     if risk_per_trade is None:
         risk_per_trade = PORTFOLIO_RISK_PER_TRADE
 
@@ -1476,15 +1489,18 @@ def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_tr
     curve = []
     taken = skipped = 0
     skipped_losslimit = 0
+    skipped_persym = 0
     win_amt = loss_amt = 0.0
     rs = []
     seq = 0
     loss_times = deque()  # زمان بسته شدن ضررها (برای محدودیت روز/هفته)
+    open_by_sym = {}      # تعداد ترید باز هر نماد (برای سقف هر چارت)
 
     def close_until(t_now):
         nonlocal eq, peak, max_dd, win_amt, loss_amt
         while open_heap and open_heap[0][0] <= t_now:
-            xt, _, ramt, r = heapq.heappop(open_heap)
+            xt, _, ramt, r, sym_ = heapq.heappop(open_heap)
+            open_by_sym[sym_] = max(0, open_by_sym.get(sym_, 0) - 1)
             pnl = ramt * r
             eq += pnl
             if pnl > 0: win_amt += pnl
@@ -1497,10 +1513,14 @@ def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_tr
             max_dd = max(max_dd, dd)
             curve.append((xt, eq))
 
-    for entry_t, exit_t, r in zip(t["زمان_ورود"], t["زمان_خروج"], t["نتیجه_R"]):
+    for sym, entry_t, exit_t, r in zip(t["نماد"], t["زمان_ورود"], t["زمان_خروج"], t["نتیجه_R"]):
         close_until(entry_t)
-        if len(open_heap) >= max_open:
+        if len(open_heap) >= open_cap:
             skipped += 1
+            continue
+        # سقف «هر چارت»: مثل ربات لایو، هر نماد هم‌زمان فقط N ترید باز
+        if per_symbol_max_open and open_by_sym.get(sym, 0) >= per_symbol_max_open:
+            skipped_persym += 1
             continue
 
         # سپر ایمنی: بعد از N ضرر در روز/هفته، ورود جدید ممنوع تا دوره عوض شود
@@ -1525,7 +1545,8 @@ def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_tr
 
         ramt = eq * (1.0 - reserve) * risk_per_trade
         seq += 1
-        heapq.heappush(open_heap, (exit_t, seq, ramt, float(r)))
+        heapq.heappush(open_heap, (exit_t, seq, ramt, float(r), sym))
+        open_by_sym[sym] = open_by_sym.get(sym, 0) + 1
         taken += 1
     close_until(pd.Timestamp.max)
 
@@ -1536,6 +1557,7 @@ def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_tr
         "ریسک_هر_معامله٪": round(risk_per_trade * 100.0, 2),
         "معاملات_انجام‌شده": int(taken),
         "معاملات_ردشده_به_خاطر_سقف": int(skipped),
+        "ردشده_سقف_هر_چارت": int(skipped_persym),
         "ردشده_محدودیت_ضرر": int(skipped_losslimit),
         "درصد_برد": round(wins / len(rs) * 100.0, 2) if rs else 0.0,
         "فاکتور_سود": round(win_amt / loss_amt, 3) if loss_amt > 0 else 999.0,
@@ -1847,8 +1869,8 @@ def main():
         # --- دلایل (از reasons_df) ---
         reasons_out = reasons_df.copy() if not reasons_df.empty else pd.DataFrame(columns=["نماد","دلیل","تعداد"])
 
-        # --- تحلیل حرفه‌ای توزیع/زمان معاملات ---
-        dist_sheets = distribution_sheets(trades_df)
+        # --- تحلیل حرفه‌ای توزیع/زمان معاملات (فقط اگر فایل جزئیات خواسته شده) ---
+        dist_sheets = distribution_sheets(trades_df) if WRITE_DETAILS else {}
 
         # --- فایل خلاصه (فقط شاخص‌های کلیدی درخواستی) ---
         summary_df = metrics_df.copy()
@@ -1880,6 +1902,27 @@ def main():
             port = portfolio_replay(trades_df, symbols=(PORTFOLIO_SYMBOLS or None))
         except Exception as e:
             print("⚠️ شبیه‌سازی پرتفوی ناموفق بود:", str(e))
+
+        # --- مقایسه‌ی «سقف اجرا» (شبیه ربات لایو) روی همان حساب مشترک ---
+        ec_out = None
+        if COMPARE_EXECCAP_MODES:
+            try:
+                ec_rows = []
+                for label, (mo, ps) in EXECCAP_MODES.items():
+                    pr = portfolio_replay(trades_df, symbols=(PORTFOLIO_SYMBOLS or None),
+                                          max_open=mo, per_symbol_max_open=ps)
+                    if pr is None:
+                        continue
+                    s = pr["stats"].copy()
+                    s.insert(0, "سقف_اجرا", label)
+                    m = pr["monthly"]
+                    s["بدترین_ماه٪"] = round(float(m["بازده٪"].min()), 2) if not m.empty else 0.0
+                    s["ماه‌های_منفی"] = int((m["بازده٪"] < 0).sum()) if not m.empty else 0
+                    ec_rows.append(s)
+                if ec_rows:
+                    ec_out = pd.concat(ec_rows, ignore_index=True)
+            except Exception as e:
+                print("⚠️ مقایسه‌ی سقف اجرا ناموفق بود:", str(e))
 
         # --- مقایسه‌ی محدودیت‌های ضرر (سپر ایمنی) روی همان حساب مشترک ---
         ll_out = None
@@ -1917,26 +1960,28 @@ def main():
                 port["stats"].to_excel(sw, sheet_name="پرتفوی", index=False)
                 port["yearly"].to_excel(sw, sheet_name="پرتفوی_سالانه", index=False)
                 port["monthly"].to_excel(sw, sheet_name="پرتفوی_ماهانه", index=False)
+            if ec_out is not None:
+                ec_out.to_excel(sw, sheet_name="مقایسه_سقف_اجرا", index=False)
             if ll_out is not None:
                 ll_out.to_excel(sw, sheet_name="مقایسه_محدودیت_ضرر", index=False)
 
-        # --- خروجی نهایی (جزئیات کامل) ---
-        with pd.ExcelWriter(detailed_path, engine="openpyxl") as writer:
-            overview_df.to_excel(writer, sheet_name="خلاصه_کلی", index=False)
-            sym_metrics.to_excel(writer, sheet_name="نتایج_اعدادی", index=False)
-            trades_by_symbol.to_excel(writer, sheet_name="معاملات_هر_نماد", index=False)
-            trades_by_year_symbol.to_excel(writer, sheet_name="معاملات_سال_نماد", index=False)
-            test_counts.to_excel(writer, sheet_name="تست1_تست2", index=False)
-            zone_stats.to_excel(writer, sheet_name="زون‌ها", index=False)
-            annual_df.to_excel(writer, sheet_name="بازده_سالانه", index=False)
-            monthly_df.to_excel(writer, sheet_name="بازده_ماهانه", index=False)
-            avg_df.to_excel(writer, sheet_name="میانگین_بازده", index=False)
-            reasons_out.to_excel(writer, sheet_name="دلایل", index=False)
-            for sheet_name, ddf in dist_sheets.items():
-                safe_name = ("تحلیل_" + str(sheet_name))[:31]
-                ddf.to_excel(writer, sheet_name=safe_name, index=False)
-
-        print("جزئیات_حرفه‌ای.xlsx ساخته شد ✅")
+        # --- خروجی نهایی (جزئیات کامل) — فقط اگر WRITE_DETAILS روشن باشد ---
+        if WRITE_DETAILS:
+            with pd.ExcelWriter(detailed_path, engine="openpyxl") as writer:
+                overview_df.to_excel(writer, sheet_name="خلاصه_کلی", index=False)
+                sym_metrics.to_excel(writer, sheet_name="نتایج_اعدادی", index=False)
+                trades_by_symbol.to_excel(writer, sheet_name="معاملات_هر_نماد", index=False)
+                trades_by_year_symbol.to_excel(writer, sheet_name="معاملات_سال_نماد", index=False)
+                test_counts.to_excel(writer, sheet_name="تست1_تست2", index=False)
+                zone_stats.to_excel(writer, sheet_name="زون‌ها", index=False)
+                annual_df.to_excel(writer, sheet_name="بازده_سالانه", index=False)
+                monthly_df.to_excel(writer, sheet_name="بازده_ماهانه", index=False)
+                avg_df.to_excel(writer, sheet_name="میانگین_بازده", index=False)
+                reasons_out.to_excel(writer, sheet_name="دلایل", index=False)
+                for sheet_name, ddf in dist_sheets.items():
+                    safe_name = ("تحلیل_" + str(sheet_name))[:31]
+                    ddf.to_excel(writer, sheet_name=safe_name, index=False)
+            print("جزئیات_حرفه‌ای.xlsx ساخته شد ✅")
     except Exception as e:
         print("⚠️ ساخت جزئیات_حرفه‌ای.xlsx ناموفق بود:", str(e))
 
