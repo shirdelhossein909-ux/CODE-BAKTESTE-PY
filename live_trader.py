@@ -74,9 +74,6 @@ except ImportError:
 # ---------------- لاگ و ضربان قلب ----------------
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# رویدادهای مهمی که علاوه بر لاگ، به گوشی (بله) هم فرستاده می‌شوند
-_BALE_MARKERS = ("🟢", "🎯", "🏁", "🚨", "🚧", "🛑", "✅ اتصال")
-
 def log(msg, symbol=""):
     stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{stamp}] {symbol + ' | ' if symbol else ''}{msg}"
@@ -87,8 +84,8 @@ def log(msg, symbol=""):
             f.write(line + "\n")
     except Exception:
         pass
-    if any(k in msg for k in _BALE_MARKERS):
-        bale_send(line)
+    # همه‌ی خط‌های لاگ، مو‌به‌مو به بله هم فرستاده می‌شوند
+    bale_send(line)
 
 
 # ---------------- خبررسانی به بله ----------------
