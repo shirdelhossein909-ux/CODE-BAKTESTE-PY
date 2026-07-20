@@ -57,7 +57,8 @@ LOG_DIR = "logs"          # پوشه‌ی لاگ، کنار همین فایل س
 # --- خبررسانی به پیام‌رسان «بله» ---
 BALE_TOKEN = ""           # توکن رباتی که در بله ساختی (خالی = خبررسانی خاموش)
 BALE_CHAT_ID = ""         # خالی بگذار تا خودش پیدا کند (فقط اول یک پیام به ربات بله‌ات بده)
-DAILY_REPORT_HOUR = 12    # ساعت ارسال گزارش روزانه‌ی درصدی (به وقت VPS)
+DAILY_REPORT_HOUR = 12    # ساعت ارسال گزارش‌های روزانه/هفتگی/ماهانه (به وقت VPS)
+START_BALANCE = 100000.0  # سرمایه‌ی اولیه — برای محاسبه‌ی «سود کل حساب از شروع» (روی حساب جدید عوضش کن)
 # =============================================
 
 # بازپخش لایو باید کل پنجره‌ی دیتا را ببیند (بدون برش تاریخ بک‌تست)
@@ -490,6 +491,101 @@ def daily_report(symbols_rev):
     log("\n".join(lines))
 
 
+def _marker_differs(fname, key):
+    """جلوگیری از ارسال تکراری گزارش‌ها (حتی بعد از ری‌استارت)."""
+    path = os.path.join(LOG_DIR, fname)
+    try:
+        with open(path, encoding="utf-8") as f:
+            if f.read().strip() == key:
+                return False
+    except Exception:
+        pass
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(key)
+    except Exception:
+        pass
+    return True
+
+
+def period_report(symbols_rev, since, title):
+    """همه‌ی معاملات بسته‌شده‌ی یک دوره در یک پیام: نماد، تاریخ، خرید/فروش،
+    نتیجه (حد سود/حد ضرر)، درصد سود/ضرر — و در آخر برایند دوره و کل حساب."""
+    acc = mt5.account_info()
+    if acc is None or acc.balance <= 0:
+        return
+    try:
+        deals = mt5.history_deals_get(since, dt.datetime.now() + dt.timedelta(days=1)) or ()
+    except Exception:
+        deals = ()
+    outs = sorted([d for d in deals if d.magic == MAGIC and d.entry == mt5.DEAL_ENTRY_OUT],
+                  key=lambda d: d.time)
+
+    lines = [title]
+    wins = losses = 0
+    total_pct = 0.0
+    best = worst = None
+    for d in outs:
+        b = symbols_rev.get(d.symbol, d.symbol)
+        when = dt.datetime.fromtimestamp(d.time).strftime("%m/%d")
+        # معامله‌ی بستن، برعکسِ جهت پوزیشن است
+        side = "فروش" if d.type == mt5.DEAL_TYPE_BUY else "خرید"
+        if d.reason == mt5.DEAL_REASON_TP:
+            res = "حد سود ✅"
+        elif d.reason == mt5.DEAL_REASON_SL:
+            res = "حد ضرر ❌"
+        else:
+            res = "بسته شد"
+        pct = (d.profit + d.swap + d.commission) / acc.balance * 100.0
+        total_pct += pct
+        if pct > 0: wins += 1
+        else: losses += 1
+        if best is None or pct > best[1]: best = (b, pct)
+        if worst is None or pct < worst[1]: worst = (b, pct)
+        lines.append(f"{when} | {b} | {side} | {res} | {pct:+.2f}٪")
+
+    if not outs:
+        lines.append("در این دوره هیچ معامله‌ای بسته نشد.")
+    else:
+        lines.append(f"— تعداد: {len(outs)} | برد: {wins} | باخت: {losses}")
+        if best:
+            lines.append(f"— بهترین: {best[0]} ({best[1]:+.2f}٪) | بدترین: {worst[0]} ({worst[1]:+.2f}٪)")
+    lines.append(f"— برایند دوره: {_pct_txt(total_pct)}")
+    floating = (acc.equity - acc.balance) / acc.balance * 100.0
+    lines.append(f"— تریدهای بازِ فعلی: {_pct_txt(floating)}")
+    total_acc = (acc.equity - START_BALANCE) / START_BALANCE * 100.0
+    lines.append(f"— کل حساب از شروع: {_pct_txt(total_acc)} (اکویتی {acc.equity:,.0f} {acc.currency})")
+
+    text = "\n".join(lines)
+    log(text, bale=False)  # در فایل و CMD کامل ثبت شود
+    # ارسال به بله؛ اگر خیلی بلند بود چند تکه می‌شود که قیچی نشود
+    chunk = []
+    size = 0
+    for ln in lines:
+        if size + len(ln) > 3000 and chunk:
+            bale_send("\n".join(chunk))
+            chunk, size = [], 0
+        chunk.append(ln)
+        size += len(ln) + 1
+    if chunk:
+        bale_send("\n".join(chunk))
+
+
+def maybe_periodic_reports(symbols_rev):
+    """گزارش هفتگی (شنبه‌ها) و ماهانه (روز اول ماه)، رأس همان ساعت گزارش روزانه."""
+    now = dt.datetime.now()
+    if now.hour != DAILY_REPORT_HOUR:
+        return
+    if now.weekday() == 5:  # شنبه — هفته‌ی معاملاتی تمام شده
+        if _marker_differs("last_weekly.txt", now.strftime("%G-W%V")):
+            period_report(symbols_rev, now - dt.timedelta(days=7), "🗓 گزارش هفتگی معاملات")
+    if now.day == 1:
+        if _marker_differs("last_monthly.txt", now.strftime("%Y-%m")):
+            prev_month_start = (now.replace(day=1) - dt.timedelta(days=1)).replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0)
+            period_report(symbols_rev, prev_month_start, "📅 گزارش ماهانه معاملات")
+
+
 def maybe_daily_report(symbols_rev):
     """هر روز رأس ساعت تعیین‌شده، فقط یک بار (حتی بعد از ری‌استارت)."""
     now = dt.datetime.now()
@@ -662,6 +758,7 @@ def main():
 
             track_positions(symbols_rev)
             maybe_daily_report(symbols_rev)
+            maybe_periodic_reports(symbols_rev)
             report_status()
             bale_flush()  # پیام‌های مانده در صف بله، هر دور دوباره تلاش می‌شوند
             heartbeat("سالم")
