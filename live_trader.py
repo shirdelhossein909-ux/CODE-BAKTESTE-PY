@@ -57,6 +57,7 @@ LOG_DIR = "logs"          # پوشه‌ی لاگ، کنار همین فایل س
 # --- خبررسانی به پیام‌رسان «بله» ---
 BALE_TOKEN = ""           # توکن رباتی که در بله ساختی (خالی = خبررسانی خاموش)
 BALE_CHAT_ID = ""         # خالی بگذار تا خودش پیدا کند (فقط اول یک پیام به ربات بله‌ات بده)
+DAILY_REPORT_HOUR = 12    # ساعت ارسال گزارش روزانه‌ی درصدی (به وقت VPS)
 # =============================================
 
 # بازپخش لایو باید کل پنجره‌ی دیتا را ببیند (بدون برش تاریخ بک‌تست)
@@ -74,7 +75,7 @@ except ImportError:
 # ---------------- لاگ و ضربان قلب ----------------
 os.makedirs(LOG_DIR, exist_ok=True)
 
-def log(msg, symbol=""):
+def log(msg, symbol="", bale=True):
     stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{stamp}] {symbol + ' | ' if symbol else ''}{msg}"
     print(line, flush=True)
@@ -84,8 +85,9 @@ def log(msg, symbol=""):
             f.write(line + "\n")
     except Exception:
         pass
-    # همه‌ی خط‌های لاگ، مو‌به‌مو به بله هم فرستاده می‌شوند
-    bale_send(line)
+    # خط‌های لاگ به بله هم فرستاده می‌شوند (مگر آن‌هایی که در پیام ترکیبی می‌روند)
+    if bale:
+        bale_send(line)
 
 
 # ---------------- خبررسانی به بله ----------------
@@ -156,7 +158,7 @@ def heartbeat(status="سالم"):
 
 
 # ---------------- اتصال ضدضربه ----------------
-def connect_with_retry():
+def connect_with_retry(bale_notify=True):
     """آن‌قدر تلاش می‌کند تا وصل شود؛ هر مشکل را با زبان ساده گزارش می‌دهد."""
     attempt = 0
     while True:
@@ -192,7 +194,7 @@ def connect_with_retry():
 
         log(f"✅ اتصال برقرار شد | حساب {acc.login} ({acc.server}) | "
             f"{'دمو' if acc.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO else 'واقعی'} | "
-            f"موجودی {acc.balance:,.2f} {acc.currency}")
+            f"موجودی {acc.balance:,.2f} {acc.currency}", bale=bale_notify)
         heartbeat("سالم")
         return acc
 
@@ -440,6 +442,74 @@ def report_status():
         pass
 
 
+# ---------------- گزارش روزانه‌ی درصدی ----------------
+_daily_file = os.path.join(LOG_DIR, "last_daily.txt")
+
+def _pct_txt(pct):
+    if pct > 0.005:
+        return f"{pct:+.2f}٪ در سود"
+    if pct < -0.005:
+        return f"{pct:+.2f}٪ در ضرر"
+    return "سربه‌سر (0.0٪)"
+
+
+def daily_report(symbols_rev):
+    """وضعیت همه‌ی تریدهای باز به «درصدِ حساب» + برایند کل — در یک پیام."""
+    acc = mt5.account_info()
+    if acc is None or acc.balance <= 0:
+        return
+    poss = [p for p in (mt5.positions_get() or ()) if p.magic == MAGIC]
+    lines = ["📊 گزارش روزانه‌ی حساب"]
+
+    if poss:
+        for p in poss:
+            b = symbols_rev.get(p.symbol, p.symbol)
+            side = "خرید" if p.type == mt5.POSITION_TYPE_BUY else "فروش"
+            pct = (p.profit + p.swap) / acc.balance * 100.0
+            lines.append(f"{b} ({side}): {_pct_txt(pct)}")
+    else:
+        lines.append("هیچ ترید بازی نیست.")
+
+    total_open = (acc.equity - acc.balance) / acc.balance * 100.0
+    lines.append(f"— برایند تریدهای باز: {_pct_txt(total_open)}")
+
+    # معاملات بسته‌شده‌ی ۲۴ ساعت اخیر
+    try:
+        frm = dt.datetime.now() - dt.timedelta(days=1)
+        deals = mt5.history_deals_get(frm, dt.datetime.now() + dt.timedelta(days=1)) or ()
+        outs = [d for d in deals if d.magic == MAGIC and d.entry == mt5.DEAL_ENTRY_OUT]
+        if outs:
+            pnl = sum(d.profit + d.swap + d.commission for d in outs)
+            lines.append(f"— بسته‌شده‌های ۲۴ ساعت اخیر: {len(outs)} معامله ({_pct_txt(pnl / acc.balance * 100.0)})")
+    except Exception:
+        pass
+
+    n_orders = len([o for o in (mt5.orders_get() or ()) if o.magic == MAGIC])
+    lines.append(f"— اوردرهای در انتظار: {n_orders}")
+    lines.append(f"— بالانس: {acc.balance:,.0f} | اکویتی: {acc.equity:,.0f} {acc.currency}")
+    log("\n".join(lines))
+
+
+def maybe_daily_report(symbols_rev):
+    """هر روز رأس ساعت تعیین‌شده، فقط یک بار (حتی بعد از ری‌استارت)."""
+    now = dt.datetime.now()
+    if now.hour != DAILY_REPORT_HOUR:
+        return
+    today = now.strftime("%Y-%m-%d")
+    try:
+        with open(_daily_file, encoding="utf-8") as f:
+            if f.read().strip() == today:
+                return
+    except Exception:
+        pass
+    try:
+        with open(_daily_file, "w", encoding="utf-8") as f:
+            f.write(today)
+    except Exception:
+        pass
+    daily_report(symbols_rev)
+
+
 # ---------------- سقف تریدهای باز: پر شد → اوردرها موقتاً جمع می‌شوند ----------------
 _cap_active = False
 
@@ -507,9 +577,9 @@ def track_positions(symbols_rev):
 
 # ---------------- حلقه‌ی اصلی ----------------
 def main():
-    log("========== شروع ربات (نسخه ۲ — دمو) ==========")
-    log(f"سبد انتخابی ({len(BASKET)} نماد): {', '.join(BASKET)} — ربات فقط روی همین‌ها کار می‌کند.")
-    connect_with_retry()
+    log("========== شروع ربات (نسخه ۲ — دمو) ==========", bale=False)
+    log(f"سبد انتخابی ({len(BASKET)} نماد): {', '.join(BASKET)} — ربات فقط روی همین‌ها کار می‌کند.", bale=False)
+    acc = connect_with_retry(bale_notify=False)
 
     symbols = {}
     for b in BASKET:
@@ -519,10 +589,20 @@ def main():
         else:
             symbols[b] = name
             if name != b:
-                log(f"اسم نماد نزد بروکر: {name}", b)
+                log(f"اسم نماد نزد بروکر: {name}", b, bale=False)
     symbols_rev = {v: k for k, v in symbols.items()}
     log(f"آماده | {len(symbols)} نماد فعال | ریسک هر معامله {RISK_PER_TRADE*100:.1f}٪ | "
-        f"حد سود {RR:g} برابر ریسک | ورود {abs(ENTRY_OFF)*100:.0f}٪ داخل زون | سقف {MAX_OPEN_TOTAL} پوزیشن")
+        f"حد سود {RR:g} برابر ریسک | ورود {abs(ENTRY_OFF)*100:.0f}٪ داخل زون | سقف {MAX_OPEN_TOTAL} پوزیشن", bale=False)
+
+    # همه‌ی اطلاعات راه‌اندازی، در «یک» پیام بله
+    bale_send(
+        "🤖 ربات روشن شد\n"
+        f"حساب: {acc.login} ({acc.server}) | {'دمو' if acc.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO else 'واقعی'}\n"
+        f"بالانس: {acc.balance:,.0f} | اکویتی: {acc.equity:,.0f} {acc.currency}\n"
+        f"سبد: {len(symbols)} نماد ({', '.join(symbols)})\n"
+        f"ریسک {RISK_PER_TRADE*100:.1f}٪ | حد سود {RR:g}R | ورود {abs(ENTRY_OFF)*100:.0f}٪ زون | "
+        f"سقف: هر چارت ۳، کل {MAX_OPEN_TOTAL}"
+    )
 
     last_bar = {b: None for b in symbols}
 
@@ -581,6 +661,7 @@ def main():
                 sync_all(symbols, "کندل جدید")
 
             track_positions(symbols_rev)
+            maybe_daily_report(symbols_rev)
             report_status()
             bale_flush()  # پیام‌های مانده در صف بله، هر دور دوباره تلاش می‌شوند
             heartbeat("سالم")
