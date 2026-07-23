@@ -37,6 +37,11 @@ BASKET = ["XAUUSD", "AUDJPY", "AUDUSD", "CHFJPY", "EURCAD", "EURNZD",
           "GBPJPY", "GBPNZD", "NZDCAD", "NZDUSD", "USDCAD", "USDCHF"]
 
 RISK_PER_TRADE = 0.005    # ریسک هر معامله: نیم درصد از اکویتی
+
+# سیو سود (برنده‌ی بک‌تست): وقتی سود پوزیشن به ۲ برابر ریسک رسید، نصف حجم نقد می‌شود
+MANAGE_PARTIAL = True
+MANAGE_TRIGGER_R = 2.0
+PARTIAL_FRAC = 0.5
 RESERVE = 0.15            # سرمایه‌ی رزرو (مثل بک‌تست)
 MAX_OPEN_TOTAL = 8        # سقف تریدهای باز هم‌زمان کل حساب — پر شود، اوردرهای در انتظار موقتاً جمع می‌شوند
 MAX_PENDING_TOTAL = 8     # سقف کل اوردرهای در انتظار روی کل حساب (هر نماد حداکثر ۳)
@@ -632,6 +637,80 @@ def enforce_open_cap(symbols_rev):
     return "ok"
 
 
+# ---------------- سیو سود در 2R ----------------
+_managed_file = os.path.join(LOG_DIR, "managed_tickets.txt")
+
+def _load_managed():
+    try:
+        with open(_managed_file, encoding="utf-8") as f:
+            return set(int(x) for x in f.read().split() if x.strip().isdigit())
+    except Exception:
+        return set()
+
+_managed = _load_managed()
+
+def _mark_managed(ticket):
+    _managed.add(int(ticket))
+    try:
+        with open(_managed_file, "a", encoding="utf-8") as f:
+            f.write(f"{ticket}\n")
+    except Exception:
+        pass
+
+
+def manage_positions(symbols_rev):
+    """سیو سود: هر پوزیشنی که سودش به ۲ برابر ریسک رسید، نصف حجمش نقد می‌شود (یک بار)."""
+    if not MANAGE_PARTIAL:
+        return
+    for p in (mt5.positions_get() or ()):
+        if p.magic != MAGIC or p.ticket in _managed or p.sl <= 0:
+            continue
+        risk_dist = abs(p.price_open - p.sl)
+        if risk_dist <= 0:
+            continue
+        tick = mt5.symbol_info_tick(p.symbol)
+        si = mt5.symbol_info(p.symbol)
+        if tick is None or si is None:
+            continue
+
+        if p.type == mt5.POSITION_TYPE_BUY:
+            reached = tick.bid >= p.price_open + MANAGE_TRIGGER_R * risk_dist
+            close_type, close_price = mt5.ORDER_TYPE_SELL, tick.bid
+        else:
+            reached = tick.ask <= p.price_open - MANAGE_TRIGGER_R * risk_dist
+            close_type, close_price = mt5.ORDER_TYPE_BUY, tick.ask
+        if not reached:
+            continue
+
+        step = si.volume_step or 0.01
+        half = math.floor(p.volume * PARTIAL_FRAC / step) * step
+        if half < si.volume_min or (p.volume - half) < si.volume_min:
+            _mark_managed(p.ticket)
+            log(f"⚠️ سیو سود {p.comment}: حجم برای نصف کردن کافی نیست ({p.volume}) — کامل می‌ماند.",
+                symbols_rev.get(p.symbol, p.symbol))
+            continue
+
+        res = mt5.order_send({
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": p.symbol,
+            "volume": round(half, 8),
+            "type": close_type,
+            "position": p.ticket,
+            "price": close_price,
+            "deviation": 50,
+            "magic": MAGIC,
+            "comment": "TP2-partial",
+            "type_filling": mt5.ORDER_FILLING_RETURN,
+        })
+        base = symbols_rev.get(p.symbol, p.symbol)
+        if res is not None and res.retcode == mt5.TRADE_RETCODE_DONE:
+            _mark_managed(p.ticket)
+            log(f"💰 سیو سود انجام شد! زون {p.comment} | سود به ۲ برابر ریسک رسید — "
+                f"{round(half, 2)} لات از {p.volume} لات نقد شد؛ بقیه به سمت تارگت ادامه می‌دهد.", base)
+        else:
+            log(f"⚠️ سیو سود {p.comment} انجام نشد | کد {getattr(res, 'retcode', mt5.last_error())} — دور بعد دوباره تلاش می‌شود.", base)
+
+
 # ---------------- رصد پر شدن و بسته شدن معاملات ----------------
 _prev_positions = {}
 
@@ -756,6 +835,7 @@ def main():
                 log(f"کندل ۴ ساعته‌ی جدید بسته شد ({', '.join(new_candle)}) — بررسی دوباره‌ی همه‌ی زون‌ها و فیلترها...")
                 sync_all(symbols, "کندل جدید")
 
+            manage_positions(symbols_rev)
             track_positions(symbols_rev)
             maybe_daily_report(symbols_rev)
             maybe_periodic_reports(symbols_rev)
