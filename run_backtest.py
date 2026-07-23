@@ -74,6 +74,19 @@ EXECCAP_MODES = {
     "هر چارت 1 + سقف 5": (5, 1),
 }
 
+# مقایسه‌ی «مدیریت معامله» (سیو سود / ریسک‌فری وقتی سود به ۲ برابر ریسک رسید)
+# نتایج در شیت «مقایسه_مدیریت»
+COMPARE_MANAGE_MODES = True
+MANAGE_MODES = {
+    "عادی (بدون مدیریت)": "none",
+    "سیو سود در 2R": "partial2",
+    "سیو سود + ریسک‌فری در 2R": "partial2_be",
+    "ریسک‌فری در 2R": "be2",
+}
+DEFAULT_MANAGE = "none"     # حالت اصلی گزارش‌های کامل
+MANAGE_TRIGGER_R = 2.0      # آستانه‌ی فعال شدن مدیریت: سود ۲ برابر ریسک
+PARTIAL_CLOSE_FRAC = 0.5    # سهم سیو سود: نصف حجم
+
 # مقایسه‌ی «محدودیت ضرر» — نتیجه: کمکی نکرد (فقط سود کمتر)؛ بدون محدودیت می‌مانیم
 COMPARE_LOSSLIMIT_MODES = False
 LOSSLIMIT_MODES = {
@@ -554,7 +567,8 @@ def log_event(events, t, symbol, zid, etype, detail=""):
 def backtest_one(symbol, h4, d1, w1, years, spread,
                  entry_off=0.10, sl_off=0.25, rr=3.0,
                  reserve=0.15, risk_per_trade=0.01, max_orders=3,
-                 m15=None, min_risk_atr=0.0, dist_cancel_r=0.0, return_state=False):
+                 m15=None, min_risk_atr=0.0, dist_cancel_r=0.0, manage_mode="none",
+                 return_state=False):
 
     bt_start = BACKTEST_START
 
@@ -768,7 +782,9 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
         if risk <= 0:
             return
 
-        result_r = (exit_price - eff_entry)/risk if direction=="BUY" else (eff_entry - exit_price)/risk
+        raw_r = (exit_price - eff_entry)/risk if direction=="BUY" else (eff_entry - exit_price)/risk
+        # سهم سیوسودشده (banked) + سهم باقی‌مانده (frac) — در حالت عادی: 0 و 1
+        result_r = pos.get("banked", 0.0) + pos.get("frac", 1.0) * float(raw_r)
 
         # کسر هزینه‌های تقریبی: کمیسیون + سواپ به ازای هر شب نگهداری
         try:
@@ -798,6 +814,51 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
         final = "پر شد: برد" if result_r>0 else "پر شد: باخت"
         set_final(zone_df, pos["ZoneID"], final, reason, exit_time)
         log_event(events, exit_time, symbol, pos["ZoneID"], "Exit", final)
+
+    def process_pos_candle(pos, h, l, t):
+        """خروج/مدیریت یک پوزیشن در یک کندل H4 — همیشه بدبینانه (اول استاپ).
+        مدیریت (سیو سود/ریسک‌فری) وقتی سود به MANAGE_TRIGGER_R برابر ریسک برسد فعال می‌شود."""
+        direction = pos["direction"]
+        sl = pos["sl"]; tp = pos["tp"]
+        if direction == "BUY":
+            hit_sl = l <= sl; hit_tp = h >= tp
+        else:
+            hit_sl = h >= sl; hit_tp = l <= tp
+
+        # فعال‌سازی مدیریت — فقط اگر در همین کندل استاپ لمس نشده باشد (بدبینانه)
+        if manage_mode != "none" and not pos.get("managed") and not hit_sl:
+            trg = pos["trigger"]
+            hit_trg = (h >= trg) if direction == "BUY" else (l <= trg)
+            if hit_trg:
+                pos["managed"] = True
+                if manage_mode in ("partial2", "partial2_be"):
+                    # نصف حجم در 2R نقد می‌شود
+                    pos["banked"] = MANAGE_TRIGGER_R * PARTIAL_CLOSE_FRAC
+                    pos["frac"] = 1.0 - PARTIAL_CLOSE_FRAC
+                if manage_mode in ("partial2_be", "be2"):
+                    # استاپ به نقطه‌ی ورود (ریسک‌فری)
+                    pos["sl"] = pos["eff_entry"]
+                    sl = pos["sl"]
+                    hit_sl = (l <= sl) if direction == "BUY" else (h >= sl)
+
+        if hit_sl and hit_tp:
+            if manage_mode == "none":
+                res = resolve_both_hit_m15(direction, sl, tp, t)
+                if res == "tp":
+                    reasons["خروج_همزمان_حل_با_M15"] += 1
+                    return True, tp, "هر دو در یک کندل: M15 → حدسود"
+                if res == "sl":
+                    reasons["خروج_همزمان_حل_با_M15"] += 1
+                    return True, sl, "هر دو در یک کندل: M15 → حدضرر"
+                reasons["خروج_همزمان_بدون_M15_استاپ_فرض"] += 1
+            return True, sl, "هر دو در یک کندل: حدضرر"
+        if hit_sl:
+            if pos.get("managed") and manage_mode in ("partial2_be", "be2"):
+                return True, sl, "سربه‌سر (ریسک‌فری)"
+            return True, sl, "حدضرر"
+        if hit_tp:
+            return True, tp, "حدسود"
+        return False, None, None
 
     used=set()
 
@@ -830,27 +891,9 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
         # ---------- exits for already-open positions ----------
         still_open=[]
         for pos in open_pos:
-            if pos["direction"] == "BUY":
-                hit_sl = l <= pos["sl"]; hit_tp = h >= pos["tp"]
-            else:
-                hit_sl = h >= pos["sl"]; hit_tp = l <= pos["tp"]
-
-            if hit_sl and hit_tp:
-                # ابهام: هر دو در یک کندل H4 — با M15 ترتیب واقعی را پیدا کن
-                res = resolve_both_hit_m15(pos["direction"], pos["sl"], pos["tp"], t)
-                if res == "tp":
-                    reasons["خروج_همزمان_حل_با_M15"] += 1
-                    finalize_trade(pos, t, float(pos["tp"]), "هر دو در یک کندل: M15 → حدسود")
-                elif res == "sl":
-                    reasons["خروج_همزمان_حل_با_M15"] += 1
-                    finalize_trade(pos, t, float(pos["sl"]), "هر دو در یک کندل: M15 → حدضرر")
-                else:
-                    reasons["خروج_همزمان_بدون_M15_استاپ_فرض"] += 1
-                    finalize_trade(pos, t, float(pos["sl"]), "هر دو در یک کندل: حدضرر")
-            elif hit_sl:
-                finalize_trade(pos, t, float(pos["sl"]), "حدضرر")
-            elif hit_tp:
-                finalize_trade(pos, t, float(pos["tp"]), "حدسود")
+            exited, exit_price, reason = process_pos_candle(pos, h, l, t)
+            if exited:
+                finalize_trade(pos, t, float(exit_price), reason)
             else:
                 still_open.append(pos)
         open_pos = still_open
@@ -1008,6 +1051,8 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
             usable = equity*(1.0 - reserve)
             risk_amt = usable*risk_per_trade
 
+            trigger = (p["eff_entry"] + MANAGE_TRIGGER_R * p["risk"]) if direction == "BUY" \
+                else (p["eff_entry"] - MANAGE_TRIGGER_R * p["risk"])
             pos = {
                 "ZoneID": p["z"].zone_id,
                 "direction": direction,
@@ -1018,11 +1063,14 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
                 "risk_amt": float(risk_amt),
                 "fill_time": t,
                 "test": p["test"],
-                "z": p["z"]
+                "z": p["z"],
+                "trigger": float(trigger),
+                "managed": False,
             }
 
             # کندل ورود: با M15 لحظه‌ی پر شدن و ترتیب استاپ/حدسود دقیق مشخص می‌شود
-            res = resolve_entry_candle_m15(direction, p["entry"], pos["sl"], pos["tp"], t)
+            res = resolve_entry_candle_m15(direction, p["entry"], pos["sl"], pos["tp"], t) \
+                if manage_mode == "none" else None
             if res == "sl":
                 reasons["کندل_ورود_حل_با_M15"] += 1
                 finalize_trade(pos, t, float(pos["sl"]), "حدضرر (کندل ورود، M15)")
@@ -1032,10 +1080,10 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
             elif res == "open":
                 new_open_positions.append(pos)
             else:
-                # M15 در دسترس نیست: رفتار قبلی (اگر هر دو لمس شد، بدبینانه استاپ)
-                exited, exit_price, reason = check_exit(direction, pos["sl"], pos["tp"], h, l)
+                # بدون M15: بدبینانه (اگر هر دو لمس شد، استاپ) + اعمال مدیریت سیوسود/ریسک‌فری
+                exited, exit_price, reason = process_pos_candle(pos, h, l, t)
                 if exited:
-                    if reason == "حدسود":
+                    if "حدسود" in str(reason):
                         reasons["TP_کندل_ورود_بدون_M15"] += 1
                     finalize_trade(pos, t, float(exit_price), reason)
                 else:
@@ -1639,6 +1687,7 @@ def main():
     rr_mode_rows=[]
     minrisk_mode_rows=[]
     distcancel_mode_rows=[]
+    manage_mode_rows=[]
     max_data_time = None
     for zp in zip_files:
         base=os.path.basename(zp)
@@ -1653,7 +1702,20 @@ def main():
 
         mdf, rdf, tdf, zdf, edf, zreason = backtest_one(symbol, h4,d1,w1, years, spreads.get(symbol, 0.0),
                                                         entry_off=DEFAULT_ENTRY_OFF, rr=DEFAULT_RR, m15=m15,
-                                                        min_risk_atr=DEFAULT_MIN_RISK_ATR)
+                                                        min_risk_atr=DEFAULT_MIN_RISK_ATR,
+                                                        manage_mode=DEFAULT_MANAGE)
+
+        # مقایسه‌ی حالت‌های مدیریت معامله (سیو سود / ریسک‌فری)
+        if COMPARE_MANAGE_MODES:
+            for mode_name, mm in MANAGE_MODES.items():
+                if mm == DEFAULT_MANAGE:
+                    m_mm = mdf.copy()
+                else:
+                    m_mm = backtest_one(symbol, h4, d1, w1, years, spreads.get(symbol, 0.0),
+                                        entry_off=DEFAULT_ENTRY_OFF, rr=DEFAULT_RR, m15=m15,
+                                        manage_mode=mm)[0].copy()
+                m_mm["مدیریت"] = mode_name
+                manage_mode_rows.append(m_mm)
 
         # اجرای RR های دیگر فقط برای مقایسه (گزارش‌های کامل با DEFAULT_RR است)
         if COMPARE_RR_MODES:
@@ -1895,6 +1957,7 @@ def main():
         rr_out = _aggregate_mode_rows(rr_mode_rows, "حالت_RR") if (COMPARE_RR_MODES and rr_mode_rows) else None
         mr_out = _aggregate_mode_rows(minrisk_mode_rows, "حداقل_زون") if (COMPARE_MINRISK_MODES and minrisk_mode_rows) else None
         dc_out = _aggregate_mode_rows(distcancel_mode_rows, "قانون_لغو_دور") if (COMPARE_DISTCANCEL_MODES and distcancel_mode_rows) else None
+        mg_out = _aggregate_mode_rows(manage_mode_rows, "مدیریت") if (COMPARE_MANAGE_MODES and manage_mode_rows) else None
 
         # --- شبیه‌سازی حساب مشترک (پرتفوی) ---
         port = None
@@ -1956,6 +2019,8 @@ def main():
                 mr_out.to_excel(sw, sheet_name="مقایسه_حداقل_زون", index=False)
             if dc_out is not None:
                 dc_out.to_excel(sw, sheet_name="مقایسه_لغو_دور", index=False)
+            if mg_out is not None:
+                mg_out.to_excel(sw, sheet_name="مقایسه_مدیریت", index=False)
             if port is not None:
                 port["stats"].to_excel(sw, sheet_name="پرتفوی", index=False)
                 port["yearly"].to_excel(sw, sheet_name="پرتفوی_سالانه", index=False)
