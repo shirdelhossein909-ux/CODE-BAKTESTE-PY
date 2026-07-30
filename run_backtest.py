@@ -104,90 +104,6 @@ LOSSLIMIT_MODES = {
     "3 ضرر روز / 5 هفته": (3, 5),
 }
 
-# (خروجی PDF/ژورنال در نسخه 1.9 تولید نمی‌شود)
-# این وابستگی‌ها اختیاری هستند؛ اگر نصب نبودند، بک‌تست همچنان اجرا می‌شود.
-canvas = None
-A4 = (595.27, 841.89)
-pdfmetrics = None
-TTFont = None
-arabic_reshaper = None
-
-
-def get_display(x):  # type: ignore
-    return x
-
-
-try:
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-except ImportError:
-    pass
-
-try:
-    import arabic_reshaper
-except ImportError:
-    arabic_reshaper = None
-
-try:
-    from bidi.algorithm import get_display as _bidi_get_display
-    get_display = _bidi_get_display  # type: ignore
-except ImportError:
-    pass
-# ---------------- Persian helpers ----------------
-def fa(s: str) -> str:
-    s = str(s)
-    if arabic_reshaper is None:
-        return s
-    return get_display(arabic_reshaper.reshape(s))
-def _find_fa_font_path():
-    candidates = [
-        r"C:\Windows\Fonts\tahoma.ttf",
-        r"C:\Windows\Fonts\Tahoma.ttf",
-        r"C:\Windows\Fonts\arial.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/Library/Fonts/Arial Unicode.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-    ]
-
-    for fp in candidates:
-        if os.path.exists(fp):
-            return fp
-
-    local_fonts = glob.glob(os.path.join(os.getcwd(), "fonts", "*.ttf"))
-    if local_fonts:
-        return local_fonts[0]
-
-    return None
-
-
-def register_fa_font():
-    if pdfmetrics is None or TTFont is None:
-        raise RuntimeError("کتابخانه reportlab نصب نیست.")
-
-    font_path = _find_fa_font_path()
-    if not font_path:
-        raise RuntimeError("فونت مناسب فارسی پیدا نشد (tahoma/dejavu/arial یا fonts/*.ttf).")
-
-    pdfmetrics.registerFont(TTFont("FA", font_path))
-    return "FA"
-
-def wrap_text(s: str, max_chars=80):
-    words = str(s).split()
-    lines = []
-    cur = ""
-    for w in words:
-        if len(cur) + len(w) + 1 > max_chars:
-            lines.append(cur)
-            cur = w
-        else:
-            cur = (cur + " " + w).strip()
-    if cur:
-        lines.append(cur)
-    return lines
-
 # ------------- CSV reader (MetaTrader no header) -------------
 def _smart_dt(d, t=None):
     """تبدیل تاریخ به datetime با تشخیص خودکار ترتیب روز/ماه (برای فرمت‌های مختلف بروکرها)."""
@@ -323,15 +239,6 @@ def range_filter(df: pd.DataFrame, atr_s: pd.Series, lookback=20, k=3.0):
 
 
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Compatibility helper for live strategy engine.
-
-    Uses the same indicator primitives already defined in this module.
-    """
-    out = df.copy()
-    out["atr"] = atr(out)
-    out["range"] = range_filter(out, out["atr"])
-    return out
 def swing_points(df: pd.DataFrame, n=1):
     highs = df["high"].values
     lows  = df["low"].values
@@ -440,7 +347,9 @@ def build_zones(df, symbol, tf, max_base_len, atr_s):
             if not (bull or bear):
                 continue
 
-            doji_flags=[is_doji_small(r, atr_s.iloc[idx]) for idx, r in base.iterrows()]
+            # ATR هر کندل بیس با موقعیت (نه برچسب ایندکس) خوانده می‌شود تا وابسته به ایندکس نباشد
+            atr_vals = atr_s.iloc[i:i+L].tolist()
+            doji_flags=[is_doji_small(r, atr_vals[k]) for k, (_, r) in enumerate(base.iterrows())]
             doji_shadow = bool(all(doji_flags))
 
             if bull:
@@ -476,30 +385,6 @@ def overlap_ratio(a_low,a_high,b_low,b_high):
     inter=max(0.0, min(a_high,b_high)-max(a_low,b_low))
     uni=max(a_high,b_high)-min(a_low,b_low)
     return inter/uni if uni>0 else 0.0
-
-def dedup_zones(zones, thr=0.55):
-    zones=sorted(zones, key=lambda z: z.created_time)
-    clusters=[]
-    for z in zones:
-        placed=False
-        for cl in clusters:
-            rep=cl[-1]
-            if overlap_ratio(z.low(),z.high(),rep.low(),rep.high()) >= thr:
-                cl.append(z); placed=True; break
-        if not placed:
-            clusters.append([z])
-    out=[]
-    for cl in clusters:
-        rep=cl[-1]
-        low=max(c.low() for c in cl)
-        high=min(c.high() for c in cl)
-        if low < high:
-            if rep.direction=="BUY":
-                rep.proximal=high; rep.distal=low
-            else:
-                rep.proximal=low; rep.distal=high
-        out.append(rep)
-    return out
 
 def dedup_zones_pit(zones, thr=0.55):
     """حذف زون‌های هم‌پوشان بدون نگاه به آینده:
@@ -576,7 +461,7 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
                  entry_off=0.10, sl_off=0.25, rr=3.0,
                  reserve=0.15, risk_per_trade=0.01, max_orders=3,
                  m15=None, min_risk_atr=0.0, dist_cancel_r=0.0, manage_mode="none",
-                 return_state=False):
+                 max_open_per_symbol=0, return_state=False):
 
     bt_start = BACKTEST_START
 
@@ -660,9 +545,12 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
         "رد_به_خاطر_روند": 0,
         "رد_به_خاطر_زون_کوچک": 0,
         "رد_به_خاطر_سقف_سفارش": 0,
+        "رد_به_خاطر_سقف_پوزیشن_نماد": 0,
         "لغو_به_خاطر_هفتگی": 0,
         "لغو_به_خاطر_دور_شدن": 0,
         "لغو_به_خاطر_تست_سوم": 0,
+        "لغو_سفارشِ_زون_باطل": 0,
+        "لغو_به_خاطر_رنج_یا_روند_لحظه_ورود": 0,
         "انقضا_زون": 0,
         "جایگزینی_زون": 0,
         "ورود_انجام_شد": 0,
@@ -766,22 +654,6 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
                 "active":True,"filled":False,"fill_time":None,"cancel":None,
                 "risk": float(risk)}
 
-    def check_exit(direction, sl, tp, bar_high, bar_low):
-        if direction == "BUY":
-            hit_sl = bar_low <= sl
-            hit_tp = bar_high >= tp
-        else:
-            hit_sl = bar_high >= sl
-            hit_tp = bar_low <= tp
-
-        if hit_sl and hit_tp:
-            return True, sl, "هر دو در یک کندل: حدضرر"
-        if hit_sl:
-            return True, sl, "حدضرر"
-        if hit_tp:
-            return True, tp, "حدسود"
-        return False, None, None
-
     def finalize_trade(pos, exit_time, exit_price, reason):
         nonlocal equity, peak, max_dd
         direction = pos["direction"]
@@ -868,6 +740,17 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
             return True, tp, "حدسود"
         return False, None, None
 
+    def cancel_orders_of_zone(z, t_now, why_short, why_long):
+        """سفارش‌های پرنشده‌ی یک زون را وقتی زون بی‌اعتبار می‌شود لغو می‌کند."""
+        n = 0
+        for p in pending:
+            if p["active"] and not p["filled"] and p["z"] is z:
+                p["active"] = False
+                p["cancel"] = why_long
+                n += 1
+                log_event(events, t_now, symbol, z.zone_id, "Canceled", why_short)
+        return n
+
     used=set()
 
     for i in range(len(h4)):
@@ -916,6 +799,9 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
             if z.superseded_time is not None and t >= z.superseded_time:
                 z.expired=True
                 reasons["جایگزینی_زون"] += 1
+                # سفارش پرنشده‌ی این زون هم باید لغو شود (زون دیگر معتبر نیست)
+                reasons["لغو_سفارشِ_زون_باطل"] += cancel_orders_of_zone(
+                    z, t, "SupersededZone", "لغو: زون جدید هم‌پوشان جایگزین شد")
                 set_final(zone_df, z.zone_id, "منقضی شد", "زون جدید هم‌پوشان جایگزین شد", t)
                 log_event(events, t, symbol, z.zone_id, "Superseded", "")
                 continue
@@ -941,6 +827,9 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
             if z.touch_count==1 and z.last_touch_i is not None and (i - z.last_touch_i) > 50:
                 z.expired=True
                 reasons["انقضا_زون"] += 1
+                # سفارش پرنشده‌ی زون منقضی هم لغو می‌شود
+                reasons["لغو_سفارشِ_زون_باطل"] += cancel_orders_of_zone(
+                    z, t, "ExpiredZone", "لغو: زون منقضی شد")
                 set_final(zone_df, z.zone_id, "منقضی شد", "Touch2 تا ۵۰ کندل نیامد", t)
                 log_event(events, t, symbol, z.zone_id, "Expired", "")
 
@@ -972,6 +861,13 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
                 reasons["رد_به_خاطر_سقف_سفارش"] += 1
                 set_final(zone_df, z.zone_id, "رد شد", "سقف سفارش هم‌زمان", t)
                 log_event(events, t, symbol, z.zone_id, "Rejected", "سقف سفارش")
+                used.add(id(z)); continue
+
+            # سقف اختیاری پوزیشن باز هر نماد (۰ = بدون محدودیت، مثل رفتار فعلی)
+            if max_open_per_symbol and len(open_pos) >= max_open_per_symbol:
+                reasons["رد_به_خاطر_سقف_پوزیشن_نماد"] += 1
+                set_final(zone_df, z.zone_id, "رد شد", "سقف پوزیشن باز این نماد", t)
+                log_event(events, t, symbol, z.zone_id, "Rejected", "سقف پوزیشن نماد")
                 used.add(id(z)); continue
 
             # فیلتر حداقل اندازه‌ی زون: فاصله‌ی ورود تا استاپ باید حداقل min_risk_atr برابر ATR باشد
@@ -1035,7 +931,7 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
             if drg or hrg or dtr==0 or htr==0 or dtr!=htr:
                 p["active"]=False
                 p["cancel"]="لغو: عدم هم‌جهتی/رنج در لحظه ورود"
-                reasons["رد_به_خاطر_روند"] += 1
+                reasons["لغو_به_خاطر_رنج_یا_روند_لحظه_ورود"] += 1
                 set_final(zone_df, p["z"].zone_id, "لغو شد", "عدم هم‌جهتی/رنج در لحظه ورود", t)
                 log_event(events, t, symbol, p["z"].zone_id, "Canceled", "Trend/Range at Fill")
                 continue
@@ -1204,6 +1100,7 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
             } for pos in open_pos],
             "armed": [],
             "فیلتر_توضیح": "",
+            "دلیل_نبود": "",
         }
 
         # زون‌های «آماده‌باش» برای لایو: هنوز تاچ نشده‌اند ولی اگر قیمت وسط کندل بیاید،
@@ -1223,6 +1120,23 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
                 f"رنج روزانه: {'بله' if warm and bool(drg_now) else 'خیر'} | "
                 f"رنج H4: {'بله' if warm and bool(hrg_now) else 'خیر'}"
             )
+
+            # دلیل دقیق نبودِ معامله (برای عیب‌یابی زنده)
+            blockers = []
+            if not warm:
+                blockers.append("اندیکاتورها هنوز آماده نیستند")
+            else:
+                if bool(drg_now):
+                    blockers.append("بازار روزانه رنج است")
+                if bool(hrg_now):
+                    blockers.append("بازار ۴ساعته رنج است")
+                if dtr_now == 0:
+                    blockers.append("روند روزانه مشخص نیست")
+                if htr_now == 0:
+                    blockers.append("روند ۴ساعته مشخص نیست")
+                if dtr_now != 0 and htr_now != 0 and dtr_now != htr_now:
+                    blockers.append(f"روند روزانه {trend_txt.get(dtr_now)} ولی ۴ساعته {trend_txt.get(htr_now)} (ناهم‌جهت)")
+            state["دلیل_نبود"] = " + ".join(blockers) if blockers else "فیلترها سبزند"
 
             if filters_ok:
                 wz_now = [wz for wz in w_z
@@ -1268,46 +1182,6 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
     return metrics_df, reasons_df, tdf, zone_df, events_df, z_reason
 
 # ---------------- PDFs ----------------
-def write_journal_pdf(out_path, version_name, changes, upgrades, q_answers):
-    font=register_fa_font()
-    W,H=A4; m=40
-    c=canvas.Canvas(out_path, pagesize=A4)
-    y=H-m
-
-    def line(txt, size=10, gap=12):
-        nonlocal y
-        if y < m+60:
-            c.showPage(); y=H-m
-        c.setFont(font, size)
-        c.drawRightString(W-m, y, fa(txt))
-        y -= gap
-
-    line(f"ژورنال ورژن {version_name}", 14, 20)
-    line(" ", 10, 6)
-
-    line("چه تغییری ایجاد کردم؟", 12, 16)
-    for u in upgrades:
-        for ln in wrap_text("• "+u, 80):
-            line(ln, 10, 12)
-
-    line(" ", 10, 10)
-    line("موارد ارتقا یافته در گزارش‌دهی:", 12, 16)
-    for u in upgrades:
-        for ln in wrap_text("• "+u, 80):
-            line(ln, 10, 12)
-
-    line(" ", 10, 10)
-    line("سه سؤال اصلی + سؤال جدید:", 12, 16)
-    for k,v in q_answers.items():
-        line(k, 11, 14)
-        for ln in wrap_text(v, 80):
-            line("— "+ln, 10, 12)
-        line(" ", 10, 6)
-
-    c.save()
-
-
-# ---------------- Comparison Helpers ----------------
 def _parse_version_tuple(name: str):
     """
     تبدیل Z_v1.4 -> (1,4) برای مرتب‌سازی نسخه‌ها

@@ -219,6 +219,19 @@ def ensure_connected():
         log("🔄 ارتباط دوباره برقرار شد — ادامه می‌دهیم.")
 
 
+def pick_filling(si, for_market=True):
+    """حالت پرکردن سفارش را از خود نماد می‌خواند (رفع خطای 10030).
+    برای بستن پوزیشن (market): IOC یا FOK — برای پندینگ: RETURN."""
+    modes = getattr(si, "filling_mode", 0) or 0
+    if for_market:
+        if modes & 2:   # SYMBOL_FILLING_IOC
+            return mt5.ORDER_FILLING_IOC
+        if modes & 1:   # SYMBOL_FILLING_FOK
+            return mt5.ORDER_FILLING_FOK
+        return mt5.ORDER_FILLING_IOC
+    return mt5.ORDER_FILLING_RETURN
+
+
 def resolve_symbol(base):
     """پیدا کردن اسم نماد نزد بروکر (با پسوند/پیشوند احتمالی) و فعال‌سازی آن."""
     if mt5.symbol_info(base) is not None:
@@ -366,7 +379,7 @@ def sync_all(symbols, reason_txt="بازبینی"):
         if st is None:
             continue
         all_wanted[b] = list(st["pending"]) + list(st.get("armed", []))
-        notes[b] = st.get("فیلتر_توضیح", "")
+        notes[b] = st.get("دلیل_نبود", "") or st.get("فیلتر_توضیح", "")
 
     # ۲) سهمیه‌بندی منصفانه (طبق نتیجه‌ی بک‌تست «هر چارت ۳ + سقف ۸»):
     # دور اول به هر نماد یک اوردر، بعد دور دوم و سوم — تا سقف کل
@@ -400,7 +413,11 @@ def sync_all(symbols, reason_txt="بازبینی"):
                 placed_something = True
 
         if not all_wanted.get(b):
-            log(f"معامله‌ای لازم نیست. دلیل: یا زون تازه‌ای نزدیک قیمت نیست، یا فیلترها اجازه نمی‌دهند ({notes.get(b, '')})", b)
+            note = notes.get(b, "")
+            if note == "فیلترها سبزند":
+                log("معامله‌ای لازم نیست. فیلترها سبزند ولی زون معتبرِ لمس‌نشده‌ای نزدیک قیمت نیست.", b)
+            else:
+                log(f"معامله‌ای لازم نیست. دلیل: {note}", b)
         elif desired and not placed_something and all(z in existing for z in desired):
             log(f"وضعیت بدون تغییر | اوردرهای فعال: {len(existing)}", b)
 
@@ -690,7 +707,8 @@ def manage_positions(symbols_rev):
                 symbols_rev.get(p.symbol, p.symbol))
             continue
 
-        res = mt5.order_send({
+        base = symbols_rev.get(p.symbol, p.symbol)
+        req = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": p.symbol,
             "volume": round(half, 8),
@@ -700,9 +718,22 @@ def manage_positions(symbols_rev):
             "deviation": 50,
             "magic": MAGIC,
             "comment": "TP2-partial",
-            "type_filling": mt5.ORDER_FILLING_RETURN,
-        })
-        base = symbols_rev.get(p.symbol, p.symbol)
+        }
+        # حالت پرکردن را از نماد می‌گیریم؛ اگر رد شد، حالت‌های دیگر را هم امتحان می‌کنیم
+        res = None
+        tried = []
+        for fm in (pick_filling(si, True), mt5.ORDER_FILLING_FOK,
+                   mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN):
+            if fm in tried:
+                continue
+            tried.append(fm)
+            req["type_filling"] = fm
+            res = mt5.order_send(req)
+            if res is not None and res.retcode == mt5.TRADE_RETCODE_DONE:
+                break
+            if res is not None and res.retcode != 10030:  # فقط خطای «حالت پرکردن» ارزش تلاش دوباره دارد
+                break
+
         if res is not None and res.retcode == mt5.TRADE_RETCODE_DONE:
             _mark_managed(p.ticket)
             log(f"💰 سیو سود انجام شد! زون {p.comment} | سود به ۲ برابر ریسک رسید — "
