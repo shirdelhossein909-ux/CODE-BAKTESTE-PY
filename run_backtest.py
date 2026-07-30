@@ -34,6 +34,14 @@ RR_MODES = {
 }
 DEFAULT_RR = 3.0  # حالت اصلی گزارش‌های کامل
 
+# مقایسه‌ی فاصله‌ی حد ضرر از دیستال‌لاین (به نسبت کل ارتفاع زون) — شیت «مقایسه_استاپ»
+COMPARE_SL_MODES = True
+SL_MODES = {
+    "استاپ 25٪ پشت دیستال": 0.25,
+    "استاپ 50٪ پشت دیستال": 0.50,
+}
+DEFAULT_SL_OFF = 0.25  # حالت اصلی گزارش‌های کامل
+
 # قانون «لغو سفارش در صورت دور شدن قیمت»: اگر قیمت بدون فعال کردن سفارش،
 # به اندازه‌ی چند برابرِ ریسک از نقطه‌ی ورود دور شد، سفارش لغو و زون بی‌اعتبار می‌شود.
 # چند آستانه در یک اجرا مقایسه می‌شود — شیت «مقایسه_لغو_دور»
@@ -1688,6 +1696,7 @@ def main():
     minrisk_mode_rows=[]
     distcancel_mode_rows=[]
     manage_mode_rows=[]
+    sl_mode_rows=[]
     max_data_time = None
     for zp in zip_files:
         base=os.path.basename(zp)
@@ -1701,9 +1710,22 @@ def main():
                 max_data_time = end_t if max_data_time is None else max(max_data_time, end_t)
 
         mdf, rdf, tdf, zdf, edf, zreason = backtest_one(symbol, h4,d1,w1, years, spreads.get(symbol, 0.0),
-                                                        entry_off=DEFAULT_ENTRY_OFF, rr=DEFAULT_RR, m15=m15,
+                                                        entry_off=DEFAULT_ENTRY_OFF, sl_off=DEFAULT_SL_OFF,
+                                                        rr=DEFAULT_RR, m15=m15,
                                                         min_risk_atr=DEFAULT_MIN_RISK_ATR,
                                                         manage_mode=DEFAULT_MANAGE)
+
+        # مقایسه‌ی فاصله‌ی حد ضرر (۲۵٪ در برابر ۵۰٪ پشت دیستال)
+        if COMPARE_SL_MODES:
+            for mode_name, so in SL_MODES.items():
+                if abs(so - DEFAULT_SL_OFF) < 1e-12:
+                    m_sl = mdf.copy()
+                else:
+                    m_sl = backtest_one(symbol, h4, d1, w1, years, spreads.get(symbol, 0.0),
+                                        entry_off=DEFAULT_ENTRY_OFF, sl_off=so, rr=DEFAULT_RR,
+                                        m15=m15, manage_mode=DEFAULT_MANAGE)[0].copy()
+                m_sl["حالت_استاپ"] = mode_name
+                sl_mode_rows.append(m_sl)
 
         # مقایسه‌ی حالت‌های مدیریت معامله (سیو سود / ریسک‌فری)
         if COMPARE_MANAGE_MODES:
@@ -1958,6 +1980,7 @@ def main():
         mr_out = _aggregate_mode_rows(minrisk_mode_rows, "حداقل_زون") if (COMPARE_MINRISK_MODES and minrisk_mode_rows) else None
         dc_out = _aggregate_mode_rows(distcancel_mode_rows, "قانون_لغو_دور") if (COMPARE_DISTCANCEL_MODES and distcancel_mode_rows) else None
         mg_out = _aggregate_mode_rows(manage_mode_rows, "مدیریت") if (COMPARE_MANAGE_MODES and manage_mode_rows) else None
+        sl_out = _aggregate_mode_rows(sl_mode_rows, "حالت_استاپ") if (COMPARE_SL_MODES and sl_mode_rows) else None
 
         # --- شبیه‌سازی حساب مشترک (پرتفوی) ---
         port = None
@@ -2021,6 +2044,8 @@ def main():
                 dc_out.to_excel(sw, sheet_name="مقایسه_لغو_دور", index=False)
             if mg_out is not None:
                 mg_out.to_excel(sw, sheet_name="مقایسه_مدیریت", index=False)
+            if sl_out is not None:
+                sl_out.to_excel(sw, sheet_name="مقایسه_استاپ", index=False)
             if port is not None:
                 port["stats"].to_excel(sw, sheet_name="پرتفوی", index=False)
                 port["yearly"].to_excel(sw, sheet_name="پرتفوی_سالانه", index=False)
