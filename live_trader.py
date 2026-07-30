@@ -412,14 +412,20 @@ def sync_all(symbols, reason_txt="بازبینی"):
             if place_pending(b, name, p):
                 placed_something = True
 
+        # گزارش وضعیت هر چارت — همیشه، با دلیل دقیق
+        note = notes.get(b, "")
+        n_open_sym = len([p for p in my_positions if p.symbol == name])
         if not all_wanted.get(b):
-            note = notes.get(b, "")
             if note == "فیلترها سبزند":
-                log("معامله‌ای لازم نیست. فیلترها سبزند ولی زون معتبرِ لمس‌نشده‌ای نزدیک قیمت نیست.", b)
+                why = "فیلترها سبزند ولی زون معتبرِ لمس‌نشده‌ای نزدیک قیمت نیست"
             else:
-                log(f"معامله‌ای لازم نیست. دلیل: {note}", b)
-        elif desired and not placed_something and all(z in existing for z in desired):
-            log(f"وضعیت بدون تغییر | اوردرهای فعال: {len(existing)}", b)
+                why = note
+            log(f"⛔ معامله نمی‌کند | دلیل: {why} | اوردر فعال: {len(existing)} | ترید باز: {n_open_sym}", b)
+        elif not desired:
+            log(f"⏸️ زون آماده دارد ولی سهمیه‌ی اوردر (سقف {MAX_PENDING_TOTAL} کل حساب) پر است | "
+                f"زون‌های واجد شرایط: {len(all_wanted.get(b, []))}", b)
+        elif not placed_something:
+            log(f"✔️ بدون تغییر | اوردر فعال: {len(existing)} | ترید باز: {n_open_sym} | وضعیت فیلترها: {note}", b)
 
     log(f"همگام‌سازی کامل شد ({reason_txt}) | اوردرهای تخصیص‌یافته: {total} از سقف {MAX_PENDING_TOTAL}")
 
@@ -762,6 +768,8 @@ def track_positions(symbols_rev):
     for tk, p in _prev_positions.items():
         if tk not in cur:
             base = symbols_rev.get(p.symbol, p.symbol)
+            acc = mt5.account_info()
+            bal = acc.balance if (acc and acc.balance > 0) else START_BALANCE
             profit_txt, why = "", "بسته شد"
             try:
                 frm = dt.datetime.now() - dt.timedelta(days=7)
@@ -769,14 +777,21 @@ def track_positions(symbols_rev):
                 if deals:
                     outs = [d for d in deals if d.entry == mt5.DEAL_ENTRY_OUT]
                     profit = sum(d.profit + d.swap + d.commission for d in outs)
-                    profit_txt = f" | نتیجه: {'سود' if profit >= 0 else 'ضرر'} {abs(profit):,.2f} دلار"
+                    profit_txt = f" | نتیجه‌ی این معامله: {_pct_txt(profit / bal * 100.0)}"
                     if outs:
                         r = outs[-1].reason
                         if r == mt5.DEAL_REASON_SL: why = "حد ضرر خورد"
                         elif r == mt5.DEAL_REASON_TP: why = "حد سود خورد ✨"
             except Exception:
                 pass
-            log(f"🏁 معامله بسته شد ({why}) | زون {p.comment}{profit_txt}", base)
+            # برایند کل حساب از شروع + برایند تریدهای بازِ فعلی
+            total_txt = ""
+            if acc:
+                total = (acc.equity - START_BALANCE) / START_BALANCE * 100.0
+                floating = (acc.equity - acc.balance) / bal * 100.0
+                total_txt = (f" | برایند کل حساب: {_pct_txt(total)}"
+                             f" | تریدهای باز: {_pct_txt(floating)}")
+            log(f"🏁 معامله بسته شد ({why}) | زون {p.comment}{profit_txt}{total_txt}", base)
 
     _prev_positions = cur
 
