@@ -34,8 +34,19 @@ RR_MODES = {
 }
 DEFAULT_RR = 3.0  # حالت اصلی گزارش‌های کامل
 
+# مقایسه‌ی فیلترهای کیفیت زون (به سبک Odds Enhancers الفونسو) — شیت «مقایسه_کیفیت_زون»
+COMPARE_QUALITY_MODES = True
+QUALITY_MODES = {
+    "مبنا (بدون فیلتر کیفیت)": {},
+    "باطل شدن زون شکسته": {"invalidate_on_breach": True},
+    "حاشیه سود ≥3R": {"min_profit_margin_r": 3.0},
+    "قدرت خروج ≥1×ATR": {"min_departure_atr": 1.0},
+    "فرصت دوباره به زون ردشده": {"retry_rejected_zones": True},
+    "فرصت دوباره + باطل‌شدن شکسته": {"retry_rejected_zones": True, "invalidate_on_breach": True},
+}
+
 # مقایسه‌ی فاصله‌ی حد ضرر از دیستال‌لاین (به نسبت کل ارتفاع زون) — شیت «مقایسه_استاپ»
-COMPARE_SL_MODES = True
+COMPARE_SL_MODES = False  # نتیجه: ۲۵٪ برنده شد و پیش‌فرض است
 SL_MODES = {
     "استاپ 25٪ پشت دیستال": 0.25,
     "استاپ 50٪ پشت دیستال": 0.50,
@@ -320,6 +331,8 @@ class Zone:
         self.expired=False
         self.zone_id=None
         self.superseded_time=None  # زمانی که زون جدیدِ هم‌پوشان جای این زون را می‌گیرد
+        self.conf_body_atr=0.0     # قدرت خروج: بدنه‌ی کندل تأیید نسبت به ATR
+        self.departure_h=0.0       # حاشیه‌ی سود: بیشترین حرکت از زون (برحسب ارتفاع زون) پیش از بازگشت
 
     def low(self): return min(self.proximal, self.distal)
     def high(self): return max(self.proximal, self.distal)
@@ -371,6 +384,32 @@ def build_zones(df, symbol, tf, max_base_len, atr_s):
 
             z=Zone(symbol, tf, direction, proximal, distal,
                    df["time"].iloc[i+L], df["time"].iloc[i], df["time"].iloc[i+L-1], doji_shadow)
+
+            # --- معیارهای کیفیت زون (به سبک Odds Enhancers) ---
+            height = z.high() - z.low()
+            # ۱) قدرت خروج: بدنه‌ی کندل تأیید نسبت به ATR همان کندل
+            atr_conf = atr_s.iloc[i+L] if (i+L) < len(atr_s) else np.nan
+            conf_body = abs(float(conf["close"]) - float(conf["open"]))
+            z.conf_body_atr = float(conf_body / atr_conf) if (not pd.isna(atr_conf) and atr_conf > 0) else 0.0
+
+            # ۲) حاشیه‌ی سود: قیمت پیش از بازگشت به زون، چند برابر ارتفاع زون حرکت کرده؟
+            #    (کاملاً گذشته‌نگر است: تا وقتی قیمت برنگردد، معامله‌ای هم رخ نمی‌دهد)
+            if height > 0:
+                best = 0.0
+                for k in range(i+L, min(i+L+200, len(df))):
+                    hi_k = float(df["high"].iloc[k]); lo_k = float(df["low"].iloc[k])
+                    if direction == "BUY":
+                        best = max(best, (hi_k - z.high()) / height)
+                        if lo_k <= z.high():      # قیمت به زون برگشت → پایان اندازه‌گیری
+                            if k > i+L:
+                                break
+                    else:
+                        best = max(best, (z.low() - lo_k) / height)
+                        if hi_k >= z.low():
+                            if k > i+L:
+                                break
+                z.departure_h = float(max(0.0, best))
+
             made=(L, z)
             break
 
@@ -461,7 +500,9 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
                  entry_off=0.10, sl_off=0.25, rr=3.0,
                  reserve=0.15, risk_per_trade=0.01, max_orders=3,
                  m15=None, min_risk_atr=0.0, dist_cancel_r=0.0, manage_mode="none",
-                 max_open_per_symbol=0, return_state=False):
+                 max_open_per_symbol=0,
+                 invalidate_on_breach=False, min_profit_margin_r=0.0, min_departure_atr=0.0,
+                 retry_rejected_zones=False, return_state=False):
 
     bt_start = BACKTEST_START
 
@@ -550,6 +591,9 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
         "لغو_به_خاطر_دور_شدن": 0,
         "لغو_به_خاطر_تست_سوم": 0,
         "لغو_سفارشِ_زون_باطل": 0,
+        "باطل_شدن_زون_شکسته": 0,
+        "رد_به_خاطر_حاشیه_سود_کم": 0,
+        "رد_به_خاطر_خروج_ضعیف": 0,
         "لغو_به_خاطر_رنج_یا_روند_لحظه_ورود": 0,
         "انقضا_زون": 0,
         "جایگزینی_زون": 0,
@@ -806,6 +850,19 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
                 log_event(events, t, symbol, z.zone_id, "Superseded", "")
                 continue
 
+            # زون شکسته باطل می‌شود: کندلِ بسته‌شده‌ی قبلی آن‌سوی دیستال‌لاین بسته شده باشد
+            # (زون‌هایی که قبلاً معامله یا رد شده‌اند شمرده نمی‌شوند تا آمار گمراه‌کننده نشود)
+            if invalidate_on_breach and id(z) not in used:
+                breached = (c_prev < z.distal) if z.direction == "BUY" else (c_prev > z.distal)
+                if breached:
+                    z.expired = True
+                    reasons["باطل_شدن_زون_شکسته"] += 1
+                    reasons["لغو_سفارشِ_زون_باطل"] += cancel_orders_of_zone(
+                        z, t, "ZoneBreached", "لغو: قیمت زون را شکست")
+                    set_final(zone_df, z.zone_id, "باطل شد", "قیمت از زون عبور کرد", t)
+                    log_event(events, t, symbol, z.zone_id, "Breached", "")
+                    continue
+
             touched = (h >= z.low() and l <= z.high())
             if touched:
                 if z.touch_count==0:
@@ -845,14 +902,20 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
             if z.touch_count==0:
                 continue
 
+            # رد به‌خاطر رنج/روند: به‌طور پیش‌فرض دائمی است؛ با retry_rejected_zones
+            # زون زنده می‌ماند و اگر بعداً شرایط سبز شد، دوباره فرصت می‌گیرد
             if drg or hrg:
                 reasons["رد_به_خاطر_رنج"] += 1
+                if retry_rejected_zones:
+                    continue
                 set_final(zone_df, z.zone_id, "رد شد", "رنج", t)
                 log_event(events, t, symbol, z.zone_id, "Rejected", "رنج")
                 used.add(id(z)); continue
 
             if dtr==0 or htr==0 or dtr!=htr:
                 reasons["رد_به_خاطر_روند"] += 1
+                if retry_rejected_zones:
+                    continue
                 set_final(zone_df, z.zone_id, "رد شد", "عدم هم‌جهتی روند D1 و H4", t)
                 log_event(events, t, symbol, z.zone_id, "Rejected", "روند")
                 used.add(id(z)); continue
@@ -861,6 +924,22 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
                 reasons["رد_به_خاطر_سقف_سفارش"] += 1
                 set_final(zone_df, z.zone_id, "رد شد", "سقف سفارش هم‌زمان", t)
                 log_event(events, t, symbol, z.zone_id, "Rejected", "سقف سفارش")
+                used.add(id(z)); continue
+
+            # حاشیه‌ی سود (Odds Enhancer): حرکت اولیه‌ی زون باید حداقل N برابر ریسک جا داده باشد
+            if min_profit_margin_r > 0:
+                risk_h = 1.0 + entry_off + sl_off          # ریسک برحسب ارتفاع زون
+                if z.departure_h < min_profit_margin_r * risk_h:
+                    reasons["رد_به_خاطر_حاشیه_سود_کم"] += 1
+                    set_final(zone_df, z.zone_id, "رد شد", "حاشیه‌ی سود حرکت اولیه کم بود", t)
+                    log_event(events, t, symbol, z.zone_id, "Rejected", "ProfitMargin")
+                    used.add(id(z)); continue
+
+            # قدرت خروج (Odds Enhancer): بدنه‌ی کندل تأیید نسبت به ATR
+            if min_departure_atr > 0 and z.conf_body_atr < min_departure_atr:
+                reasons["رد_به_خاطر_خروج_ضعیف"] += 1
+                set_final(zone_df, z.zone_id, "رد شد", "خروج از زون به‌قدر کافی قوی نبود", t)
+                log_event(events, t, symbol, z.zone_id, "Rejected", "WeakDeparture")
                 used.add(id(z)); continue
 
             # سقف اختیاری پوزیشن باز هر نماد (۰ = بدون محدودیت، مثل رفتار فعلی)
@@ -1571,6 +1650,7 @@ def main():
     distcancel_mode_rows=[]
     manage_mode_rows=[]
     sl_mode_rows=[]
+    quality_mode_rows=[]
     max_data_time = None
     for zp in zip_files:
         base=os.path.basename(zp)
@@ -1588,6 +1668,19 @@ def main():
                                                         rr=DEFAULT_RR, m15=m15,
                                                         min_risk_atr=DEFAULT_MIN_RISK_ATR,
                                                         manage_mode=DEFAULT_MANAGE)
+
+        # مقایسه‌ی فیلترهای کیفیت زون (Odds Enhancers)
+        if COMPARE_QUALITY_MODES:
+            for mode_name, kw in QUALITY_MODES.items():
+                if not kw:
+                    m_q = mdf.copy()
+                else:
+                    m_q = backtest_one(symbol, h4, d1, w1, years, spreads.get(symbol, 0.0),
+                                       entry_off=DEFAULT_ENTRY_OFF, sl_off=DEFAULT_SL_OFF,
+                                       rr=DEFAULT_RR, m15=m15, manage_mode=DEFAULT_MANAGE,
+                                       **kw)[0].copy()
+                m_q["کیفیت_زون"] = mode_name
+                quality_mode_rows.append(m_q)
 
         # مقایسه‌ی فاصله‌ی حد ضرر (۲۵٪ در برابر ۵۰٪ پشت دیستال)
         if COMPARE_SL_MODES:
@@ -1855,6 +1948,7 @@ def main():
         dc_out = _aggregate_mode_rows(distcancel_mode_rows, "قانون_لغو_دور") if (COMPARE_DISTCANCEL_MODES and distcancel_mode_rows) else None
         mg_out = _aggregate_mode_rows(manage_mode_rows, "مدیریت") if (COMPARE_MANAGE_MODES and manage_mode_rows) else None
         sl_out = _aggregate_mode_rows(sl_mode_rows, "حالت_استاپ") if (COMPARE_SL_MODES and sl_mode_rows) else None
+        q_out = _aggregate_mode_rows(quality_mode_rows, "کیفیت_زون") if (COMPARE_QUALITY_MODES and quality_mode_rows) else None
 
         # --- شبیه‌سازی حساب مشترک (پرتفوی) ---
         port = None
@@ -1920,6 +2014,8 @@ def main():
                 mg_out.to_excel(sw, sheet_name="مقایسه_مدیریت", index=False)
             if sl_out is not None:
                 sl_out.to_excel(sw, sheet_name="مقایسه_استاپ", index=False)
+            if q_out is not None:
+                q_out.to_excel(sw, sheet_name="مقایسه_کیفیت_زون", index=False)
             if port is not None:
                 port["stats"].to_excel(sw, sheet_name="پرتفوی", index=False)
                 port["yearly"].to_excel(sw, sheet_name="پرتفوی_سالانه", index=False)
