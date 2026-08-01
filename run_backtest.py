@@ -84,6 +84,27 @@ PORTFOLIO_SYMBOLS = []              # خالی = همه‌ی نمادها؛ نم
 # فایل «جزئیات_حرفه‌ای.xlsx» ساخته بشود یا نه (False = فقط خلاصه؛ سریع‌تر)
 WRITE_DETAILS = False
 
+# --- تحلیل سشن‌های معاملاتی (شیت‌های «تحلیل_سشن» و «سشن_هر_نماد») ---
+ANALYZE_SESSIONS = True
+# ساعت دیتای بروکر معمولاً UTC+2 یا UTC+3 است. برای تبدیل به UTC این عدد به ساعت‌ها اضافه می‌شود.
+# اگر مطمئن نیستی صفر بگذار و جدول «ساعت خام» را ببین، بعد کالیبره کن.
+SESSION_HOUR_SHIFT = -3   # نمونه: دیتای UTC+3 → -3 برای رسیدن به UTC
+# بازه‌های سشن بر حسب ساعت UTC — [شروع، پایان)
+SESSION_RANGES = [
+    (0, 4,  "آسیا (توکیو)"),
+    (4, 8,  "آسیا (پایان)"),
+    (8, 12, "لندن"),
+    (12, 16, "همپوشانی لندن-نیویورک"),
+    (16, 20, "نیویورک"),
+    (20, 24, "سیدنی/پایان روز"),
+]
+
+def hour_to_session(h):
+    for a, b, name in SESSION_RANGES:
+        if a <= h < b:
+            return name
+    return "نامشخص"
+
 # مقایسه‌ی «سقف اجرا» (شبیه ربات لایو): هر چارت حداکثر ۱ ترید باز + سقف کل.
 # نتایج در شیت «مقایسه_سقف_اجرا»
 COMPARE_EXECCAP_MODES = True
@@ -1442,6 +1463,48 @@ def augment_metrics_with_change_review(metrics_df: pd.DataFrame, current_dir: st
     return df_out, baseline_path
 
 # ---------------- Main ----------------
+def session_analysis(trades_df):
+    """تحلیل عملکرد استراتژی بر اساس سشن معاملاتی (از روی ساعت ورود).
+    معیار اصلی «مجموع R» است چون قابل جمع‌زدن و منصفانه است."""
+    if trades_df is None or trades_df.empty:
+        return None, None, None
+    t = trades_df.copy()
+    t["زمان_ورود"] = pd.to_datetime(t["زمان_ورود"], errors="coerce")
+    t = t.dropna(subset=["زمان_ورود", "نتیجه_R"])
+    if t.empty:
+        return None, None, None
+
+    t["ساعت_UTC"] = (t["زمان_ورود"].dt.hour + SESSION_HOUR_SHIFT) % 24
+    t["سشن"] = t["ساعت_UTC"].apply(hour_to_session)
+    total_r = float(t["نتیجه_R"].sum())
+
+    def _agg(g):
+        n = len(g)
+        wins = int((g["نتیجه_R"] > 0).sum())
+        sum_r = float(g["نتیجه_R"].sum())
+        return pd.Series({
+            "تعداد": n,
+            "درصد_برد": round(wins / n * 100.0, 2) if n else 0.0,
+            "میانگین_R": round(sum_r / n, 3) if n else 0.0,
+            "مجموع_R": round(sum_r, 1),
+            "سهم_از_کل_سود٪": round(sum_r / total_r * 100.0, 1) if total_r else 0.0,
+        })
+
+    by_session = t.groupby("سشن").apply(_agg).reset_index().sort_values("مجموع_R", ascending=False)
+    by_hour = t.groupby(["ساعت_UTC"]).apply(_agg).reset_index().sort_values("ساعت_UTC")
+
+    # جدول متقاطع نماد × سشن (مجموع R و میانگین R)
+    piv_sum = t.pivot_table(index="نماد", columns="سشن", values="نتیجه_R", aggfunc="sum").round(1)
+    piv_cnt = t.pivot_table(index="نماد", columns="سشن", values="نتیجه_R", aggfunc="count")
+    piv = piv_sum.copy()
+    piv.columns = [f"{c} (مجموع R)" for c in piv.columns]
+    for c in piv_cnt.columns:
+        piv[f"{c} (تعداد)"] = piv_cnt[c]
+    piv = piv.reset_index()
+
+    return by_session, by_hour, piv
+
+
 def _aggregate_mode_rows(rows, mode_col):
     """جدول مقایسه‌ی حالت‌ها: ردیف هر نماد + ردیف «کل» برای هر حالت."""
     cmp_df = pd.concat(rows, ignore_index=True)
@@ -1950,6 +2013,14 @@ def main():
         sl_out = _aggregate_mode_rows(sl_mode_rows, "حالت_استاپ") if (COMPARE_SL_MODES and sl_mode_rows) else None
         q_out = _aggregate_mode_rows(quality_mode_rows, "کیفیت_زون") if (COMPARE_QUALITY_MODES and quality_mode_rows) else None
 
+        # --- تحلیل سشن‌های معاملاتی ---
+        sess_out = hour_out = sesssym_out = None
+        if ANALYZE_SESSIONS:
+            try:
+                sess_out, hour_out, sesssym_out = session_analysis(trades_df)
+            except Exception as e:
+                print("⚠️ تحلیل سشن ناموفق بود:", str(e))
+
         # --- شبیه‌سازی حساب مشترک (پرتفوی) ---
         port = None
         try:
@@ -2016,6 +2087,10 @@ def main():
                 sl_out.to_excel(sw, sheet_name="مقایسه_استاپ", index=False)
             if q_out is not None:
                 q_out.to_excel(sw, sheet_name="مقایسه_کیفیت_زون", index=False)
+            if sess_out is not None:
+                sess_out.to_excel(sw, sheet_name="تحلیل_سشن", index=False)
+                hour_out.to_excel(sw, sheet_name="تحلیل_ساعت_خام", index=False)
+                sesssym_out.to_excel(sw, sheet_name="سشن_هر_نماد", index=False)
             if port is not None:
                 port["stats"].to_excel(sw, sheet_name="پرتفوی", index=False)
                 port["yearly"].to_excel(sw, sheet_name="پرتفوی_سالانه", index=False)
