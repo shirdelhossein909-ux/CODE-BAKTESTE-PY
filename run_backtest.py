@@ -89,6 +89,18 @@ WRITE_PORTFOLIO_DETAIL = False
 # --- تحلیل سشن‌های معاملاتی (شیت‌های «تحلیل_سشن» و «سشن_هر_نماد») ---
 ANALYZE_SESSIONS = True
 SESSION_STABILITY = True   # تست پایداری: آیا رتبه‌بندی سشن‌ها در هر دو نیمه‌ی دیتا یکسان می‌ماند؟
+
+# مقایسه‌ی «وزن‌دهی ریسک بر اساس سشن» — شیت «مقایسه_وزن_سشن»
+# عدد هر سشن، ضریب ریسک آن سشن است (۱ = ریسک کامل، ۰.۵ = نصف ریسک)
+COMPARE_SESSION_WEIGHTS = True
+SESSION_WEIGHT_MODES = {
+    "بدون وزن‌دهی (مبنا)": {},
+    "محافظه‌کارانه": {"آسیا (پایان)": 0.5, "نیویورک": 0.5, "آسیا (توکیو)": 0.75},
+    "تمرکز روی لندن": {"آسیا (پایان)": 0.5, "نیویورک": 0.5, "آسیا (توکیو)": 0.5,
+                        "سیدنی/پایان روز": 0.75},
+    "تهاجمی (لندن ۱.۵ برابر)": {"لندن": 1.5, "همپوشانی لندن-نیویورک": 1.25,
+                                  "آسیا (پایان)": 0.5, "نیویورک": 0.5, "آسیا (توکیو)": 0.75},
+}
 # ساعت دیتای بروکر معمولاً UTC+2 یا UTC+3 است. برای تبدیل به UTC این عدد به ساعت‌ها اضافه می‌شود.
 # اگر مطمئن نیستی صفر بگذار و جدول «ساعت خام» را ببین، بعد کالیبره کن.
 SESSION_HOUR_SHIFT = -3   # نمونه: دیتای UTC+3 → -3 برای رسیدن به UTC
@@ -1574,7 +1586,7 @@ def _aggregate_mode_rows(rows, mode_col):
 
 def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_trade=None,
                      max_open=None, symbols=None, max_losses_day=0, max_losses_week=0,
-                     per_symbol_max_open=0):
+                     per_symbol_max_open=0, session_weights=None):
     """شبیه‌سازی «یک حساب مشترک» روی معاملات همه‌ی نمادها:
     معامله‌ها به ترتیب زمان ورود اجرا می‌شوند، ریسک هر معامله ۱٪ از اکویتی لحظه‌ای حساب است،
     و اگر تعداد پوزیشن‌های باز به سقف برسد، معامله‌ی جدید گرفته نمی‌شود (رد می‌شود).
@@ -1631,7 +1643,15 @@ def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_tr
             max_dd = max(max_dd, dd)
             curve.append((xt, eq))
 
-    for sym, entry_t, exit_t, r in zip(t["نماد"], t["زمان_ورود"], t["زمان_خروج"], t["نتیجه_R"]):
+    # وزن ریسک هر معامله بر اساس سشنِ ورود (اگر وزن‌دهی فعال باشد)
+    if session_weights:
+        _sess = ((t["زمان_ورود"].dt.hour + SESSION_HOUR_SHIFT) % 24).apply(hour_to_session)
+        t = t.assign(_w=_sess.map(lambda s: float(session_weights.get(s, 1.0))))
+    else:
+        t = t.assign(_w=1.0)
+
+    for sym, entry_t, exit_t, r, w in zip(t["نماد"], t["زمان_ورود"], t["زمان_خروج"],
+                                          t["نتیجه_R"], t["_w"]):
         close_until(entry_t)
         if len(open_heap) >= open_cap:
             skipped += 1
@@ -1661,7 +1681,7 @@ def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_tr
                 skipped_losslimit += 1
                 continue
 
-        ramt = eq * (1.0 - reserve) * risk_per_trade
+        ramt = eq * (1.0 - reserve) * risk_per_trade * float(w)
         seq += 1
         heapq.heappush(open_heap, (exit_t, seq, ramt, float(r), sym))
         open_by_sym[sym] = open_by_sym.get(sym, 0) + 1
@@ -2074,6 +2094,27 @@ def main():
         except Exception as e:
             print("⚠️ شبیه‌سازی پرتفوی ناموفق بود:", str(e))
 
+        # --- مقایسه‌ی وزن‌دهی ریسک بر اساس سشن ---
+        sw_out = None
+        if COMPARE_SESSION_WEIGHTS:
+            try:
+                sw_rows = []
+                for label, weights in SESSION_WEIGHT_MODES.items():
+                    pr = portfolio_replay(trades_df, symbols=(PORTFOLIO_SYMBOLS or None),
+                                          session_weights=(weights or None))
+                    if pr is None:
+                        continue
+                    s = pr["stats"].copy()
+                    s.insert(0, "وزن‌دهی", label)
+                    m = pr["monthly"]
+                    s["بدترین_ماه٪"] = round(float(m["بازده٪"].min()), 2) if not m.empty else 0.0
+                    s["ماه‌های_منفی"] = int((m["بازده٪"] < 0).sum()) if not m.empty else 0
+                    sw_rows.append(s)
+                if sw_rows:
+                    sw_out = pd.concat(sw_rows, ignore_index=True)
+            except Exception as e:
+                print("⚠️ مقایسه‌ی وزن سشن ناموفق بود:", str(e))
+
         # --- مقایسه‌ی «سقف اجرا» (شبیه ربات لایو) روی همان حساب مشترک ---
         ec_out = None
         if COMPARE_EXECCAP_MODES:
@@ -2133,6 +2174,8 @@ def main():
                 sl_out.to_excel(sw, sheet_name="مقایسه_استاپ", index=False)
             if q_out is not None:
                 q_out.to_excel(sw, sheet_name="مقایسه_کیفیت_زون", index=False)
+            if sw_out is not None:
+                sw_out.to_excel(sw, sheet_name="مقایسه_وزن_سشن", index=False)
             if sess_out is not None:
                 sess_out.to_excel(sw, sheet_name="تحلیل_سشن", index=False)
                 hour_out.to_excel(sw, sheet_name="تحلیل_ساعت_خام", index=False)
