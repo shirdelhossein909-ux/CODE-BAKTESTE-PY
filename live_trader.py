@@ -42,6 +42,22 @@ RISK_PER_TRADE = 0.005    # ریسک هر معامله: نیم درصد از ا�
 MANAGE_PARTIAL = True
 MANAGE_TRIGGER_R = 2.0
 PARTIAL_FRAC = 0.5
+
+# --- وزن‌دهی ریسک بر اساس سشن (برنده‌ی بک‌تست: حالت تهاجمی) ---
+# ضریب ریسک هر سشن؛ ۱ = ریسک پایه (RISK_PER_TRADE)
+USE_SESSION_WEIGHTS = True
+SESSION_WEIGHTS = {
+    "لندن": 1.5,
+    "همپوشانی لندن-نیویورک": 1.25,
+    "سیدنی/پایان روز": 1.0,
+    "آسیا (توکیو)": 0.75,
+    "آسیا (پایان)": 0.5,
+    "نیویورک": 0.5,
+}
+# اگر وزن سشن عوض شد، سفارش‌های در انتظار با حجم جدید دوباره چیده شوند
+# (تا رفتار لایو با بک‌تست یکی بماند — بک‌تست وزن را بر اساس سشنِ لحظه‌ی ورود می‌گیرد)
+SESSION_REPLACE_ORDERS = True
+SESSION_REPLACE_TOLERANCE = 0.15   # اختلاف حجم کمتر از ۱۵٪ → دست نمی‌زنیم
 RESERVE = 0.15            # سرمایه‌ی رزرو (مثل بک‌تست)
 MAX_OPEN_TOTAL = 8        # سقف تریدهای باز هم‌زمان کل حساب — پر شود، اوردرهای در انتظار موقتاً جمع می‌شوند
 MAX_PENDING_TOTAL = 8     # سقف کل اوردرهای در انتظار روی کل حساب (هر نماد حداکثر ۳)
@@ -219,6 +235,15 @@ def ensure_connected():
         log("🔄 ارتباط دوباره برقرار شد — ادامه می‌دهیم.")
 
 
+def current_session_weight():
+    """وزن ریسکِ سشنِ همین لحظه (بر اساس ساعت UTC)."""
+    if not USE_SESSION_WEIGHTS:
+        return 1.0, "بدون وزن‌دهی"
+    h = dt.datetime.utcnow().hour
+    name = rb.hour_to_session(h)
+    return float(SESSION_WEIGHTS.get(name, 1.0)), name
+
+
 def pick_filling(si, for_market=True):
     """حالت پرکردن سفارش را از خود نماد می‌خواند (رفع خطای 10030).
     برای بستن پوزیشن (market): IOC یا FOK — برای پندینگ: RETURN."""
@@ -321,7 +346,8 @@ def place_pending(base, broker_name, p):
         log(f"⏭️ زون {p['zone_id']}: قیمت الان ({tick.bid}) بالاتر از نقطه‌ی ورود فروش ({entry}) است — سفارش معنا ندارد.", base)
         return
 
-    risk_amt = acc.equity * (1.0 - RESERVE) * RISK_PER_TRADE
+    w, sess_name = current_session_weight()
+    risk_amt = acc.equity * (1.0 - RESERVE) * RISK_PER_TRADE * w
     vol, vol_msg = calc_volume(broker_name, si, p["direction"], entry, sl, risk_amt, acc.equity)
     if vol is None:
         log(f"⚠️ زون {p['zone_id']}: سفارش گذاشته نشد — {vol_msg}", base)
@@ -345,7 +371,7 @@ def place_pending(base, broker_name, p):
         return False
     if res.retcode == mt5.TRADE_RETCODE_DONE:
         log(f"🟢 سفارش {side} گذاشته شد | زون {p['zone_id']} | حجم {vol} لات ({vol_msg}) | "
-            f"ورود {entry} | استاپ {sl} | تارگت {tp} | تیکت {res.order}", base)
+            f"سشن: {sess_name} × {w:g} | ورود {entry} | استاپ {sl} | تارگت {tp} | تیکت {res.order}", base)
         return True
     elif res.retcode == 10018:
         log(f"🌙 بازار بسته است — سفارش زون {p['zone_id']} بعداً گذاشته می‌شود.", base)
@@ -412,6 +438,25 @@ def sync_all(symbols, reason_txt="بازبینی"):
                 else:
                     why = f"دیگر در فهرست زون‌های معتبر نیست ({notes.get(b, 'شرایط عوض شد')})"
                 cancel_order(b, o, why=why)
+
+        # اگر وزن سشن عوض شده باشد، سفارش موجود با حجم متناسبِ سشن جدید دوباره چیده می‌شود
+        if SESSION_REPLACE_ORDERS and USE_SESSION_WEIGHTS:
+            si_ = mt5.symbol_info(name)
+            acc_ = mt5.account_info()
+            w_now, sess_now = current_session_weight()
+            for cm, o in list(existing.items()):
+                p = desired.get(cm)
+                if p is None or si_ is None or acc_ is None:
+                    continue
+                risk_amt_ = acc_.equity * (1.0 - RESERVE) * RISK_PER_TRADE * w_now
+                target, _ = calc_volume(name, si_, p["direction"],
+                                        round(p["entry"], si_.digits), round(p["sl"], si_.digits),
+                                        risk_amt_, acc_.equity)
+                if target is None or o.volume <= 0:
+                    continue
+                if abs(target - o.volume) / o.volume > SESSION_REPLACE_TOLERANCE:
+                    cancel_order(b, o, why=f"وزن سشن عوض شد ({sess_now} × {w_now:g}) — با حجم جدید چیده می‌شود")
+                    existing.pop(cm, None)
 
         placed_something = False
         for zid, p in desired.items():
