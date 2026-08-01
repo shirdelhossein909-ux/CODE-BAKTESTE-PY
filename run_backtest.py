@@ -1216,6 +1216,12 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
             "armed": [],
             "فیلتر_توضیح": "",
             "دلیل_نبود": "",
+            # دلیل نهایی هر زون (برای اینکه ربات لایو بداند چرا سفارشی دیگر معتبر نیست)
+            "دلایل_زون": {
+                str(r["ZoneID"]): f"{str(r['FinalStatus']).strip()} — {str(r['FinalReason']).strip()}"
+                for _, r in zone_df.iterrows()
+                if str(r.get("FinalStatus", "")).strip()
+            },
         }
 
         # زون‌های «آماده‌باش» برای لایو: هنوز تاچ نشده‌اند ولی اگر قیمت وسط کندل بیاید،
