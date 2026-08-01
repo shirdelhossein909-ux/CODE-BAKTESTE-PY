@@ -370,6 +370,7 @@ def sync_all(symbols, reason_txt="بازبینی"):
     # ۱) خواسته‌های استراتژی برای هر نماد (به ترتیب اولویت خود نماد)
     all_wanted = {}
     notes = {}
+    zone_reasons = {}
     for b, name in symbols.items():
         try:
             st = replay_state(b, name)
@@ -380,6 +381,7 @@ def sync_all(symbols, reason_txt="بازبینی"):
             continue
         all_wanted[b] = list(st["pending"]) + list(st.get("armed", []))
         notes[b] = st.get("دلیل_نبود", "") or st.get("فیلتر_توضیح", "")
+        zone_reasons[b] = st.get("دلایل_زون", {})
 
     # ۲) سهمیه‌بندی منصفانه (طبق نتیجه‌ی بک‌تست «هر چارت ۳ + سقف ۸»):
     # دور اول به هر نماد یک اوردر، بعد دور دوم و سوم — تا سقف کل
@@ -400,7 +402,16 @@ def sync_all(symbols, reason_txt="بازبینی"):
 
         for cm, o in existing.items():
             if cm not in desired:
-                cancel_order(b, o, why="طبق قوانین استراتژی یا سهمیه‌بندی عادلانه، دیگر در لیست نیست")
+                # دلیل دقیق لغو: اول از موتور استراتژی، وگرنه سهمیه/سقف
+                zr = zone_reasons.get(b, {}).get(str(cm), "")
+                still_wanted = any(str(p["zone_id"]) == str(cm) for p in all_wanted.get(b, []))
+                if zr:
+                    why = zr
+                elif still_wanted:
+                    why = f"زون هنوز معتبر است ولی سهمیه‌ی اوردر (سقف {MAX_PENDING_TOTAL} کل حساب) پر شد"
+                else:
+                    why = f"دیگر در فهرست زون‌های معتبر نیست ({notes.get(b, 'شرایط عوض شد')})"
+                cancel_order(b, o, why=why)
 
         placed_something = False
         for zid, p in desired.items():
