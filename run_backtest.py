@@ -87,12 +87,22 @@ WRITE_DETAILS = False
 WRITE_PORTFOLIO_DETAIL = False
 
 # --- تحلیل سشن‌های معاملاتی (شیت‌های «تحلیل_سشن» و «سشن_هر_نماد») ---
-ANALYZE_SESSIONS = True
-SESSION_STABILITY = True   # تست پایداری: آیا رتبه‌بندی سشن‌ها در هر دو نیمه‌ی دیتا یکسان می‌ماند؟
+ANALYZE_SESSIONS = False   # تحلیل سشن انجام شد؛ نتیجه‌اش در وزن‌دهی زیر اعمال شده
+SESSION_STABILITY = False
+
+# --- وزن‌دهی ریسک بر اساس سشن (نهایی: حالت تهاجمی، برنده‌ی مقایسه) ---
+USE_DEFAULT_SESSION_WEIGHTS = True
+DEFAULT_SESSION_WEIGHTS = {
+    "لندن": 1.5,
+    "همپوشانی لندن-نیویورک": 1.25,
+    "سیدنی/پایان روز": 1.0,
+    "آسیا (توکیو)": 0.75,
+    "آسیا (پایان)": 0.5,
+    "نیویورک": 0.5,
+}
 
 # مقایسه‌ی «وزن‌دهی ریسک بر اساس سشن» — شیت «مقایسه_وزن_سشن»
-# عدد هر سشن، ضریب ریسک آن سشن است (۱ = ریسک کامل، ۰.۵ = نصف ریسک)
-COMPARE_SESSION_WEIGHTS = True
+COMPARE_SESSION_WEIGHTS = False
 SESSION_WEIGHT_MODES = {
     "بدون وزن‌دهی (مبنا)": {},
     "محافظه‌کارانه": {"آسیا (پایان)": 0.5, "نیویورک": 0.5, "آسیا (توکیو)": 0.75},
@@ -1650,6 +1660,8 @@ def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_tr
             curve.append((xt, eq))
 
     # وزن ریسک هر معامله بر اساس سشنِ ورود (اگر وزن‌دهی فعال باشد)
+    if session_weights is None and USE_DEFAULT_SESSION_WEIGHTS:
+        session_weights = DEFAULT_SESSION_WEIGHTS
     if session_weights:
         _sess = ((t["زمان_ورود"].dt.hour + SESSION_HOUR_SHIFT) % 24).apply(hour_to_session)
         t = t.assign(_w=_sess.map(lambda s: float(session_weights.get(s, 1.0))))
@@ -1697,6 +1709,7 @@ def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_tr
     wins = sum(1 for r in rs if r > 0)
     stats = pd.DataFrame([{
         "تعداد_نماد": int(t["نماد"].nunique()),
+        "وزن‌دهی_سشن": "فعال (تهاجمی)" if session_weights else "خاموش",
         "سقف_پوزیشن_همزمان": int(max_open),
         "ریسک_هر_معامله٪": round(risk_per_trade * 100.0, 2),
         "معاملات_انجام‌شده": int(taken),
@@ -2065,11 +2078,9 @@ def main():
         else:
             summary_df["درصد_لاس"] = np.nan
 
+        # فقط شاخص‌های کلیدی — خروجی تمیز و خوانا
         summary_cols = [
-            "نماد", "درصد_برد", "درصد_لاس", "بازده_خالص٪", "میانگین_R", "حداکثر_افت٪", "فاکتور_سود", "تعداد",
-            "مبهم_تعداد", "مبهم_درصد", "بازده٪_اگر_مبهم_TP", "بازده٪_اگر_مبهم_استاپ",
-            "فاصله_استاپ_پیپ", "فاصله_TP_پیپ",
-            "برد_همان_کندل_تعداد", "بازده٪_اگر_برد_همان_کندل_استاپ"
+            "نماد", "تعداد", "درصد_برد", "فاکتور_سود", "میانگین_R", "بازده_خالص٪", "حداکثر_افت٪"
         ]
         for c in summary_cols:
             if c not in summary_df.columns:
