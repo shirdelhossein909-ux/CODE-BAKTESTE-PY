@@ -235,12 +235,29 @@ def ensure_connected():
         log("🔄 ارتباط دوباره برقرار شد — ادامه می‌دهیم.")
 
 
+# بازه‌های سشن (مستقل از فایل بک‌تست تعریف شده تا ربات هرگز به‌خاطر نبودِ تابع کرش نکند)
+_SESSION_RANGES = [
+    (0, 4,  "آسیا (توکیو)"),
+    (4, 8,  "آسیا (پایان)"),
+    (8, 12, "لندن"),
+    (12, 16, "همپوشانی لندن-نیویورک"),
+    (16, 20, "نیویورک"),
+    (20, 24, "سیدنی/پایان روز"),
+]
+
+def _hour_to_session(h):
+    for a, b, nm in _SESSION_RANGES:
+        if a <= h < b:
+            return nm
+    return "نامشخص"
+
+
 def current_session_weight():
     """وزن ریسکِ سشنِ همین لحظه (بر اساس ساعت UTC)."""
     if not USE_SESSION_WEIGHTS:
         return 1.0, "بدون وزن‌دهی"
-    h = dt.datetime.utcnow().hour
-    name = rb.hour_to_session(h)
+    h = dt.datetime.now(dt.timezone.utc).hour
+    name = _hour_to_session(h)
     return float(SESSION_WEIGHTS.get(name, 1.0)), name
 
 
@@ -871,15 +888,33 @@ def main():
     log(f"آماده | {len(symbols)} نماد فعال | ریسک هر معامله {RISK_PER_TRADE*100:.1f}٪ | "
         f"حد سود {RR:g} برابر ریسک | ورود {abs(ENTRY_OFF)*100:.0f}٪ داخل زون | سقف {MAX_OPEN_TOTAL} پوزیشن", bale=False)
 
-    # همه‌ی اطلاعات راه‌اندازی، در «یک» پیام بله
-    bale_send(
-        "🤖 ربات روشن شد\n"
-        f"حساب: {acc.login} ({acc.server}) | {'دمو' if acc.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO else 'واقعی'}\n"
-        f"بالانس: {acc.balance:,.0f} | اکویتی: {acc.equity:,.0f} {acc.currency}\n"
-        f"سبد: {len(symbols)} نماد ({', '.join(symbols)})\n"
-        f"ریسک {RISK_PER_TRADE*100:.1f}٪ | حد سود {RR:g}R | ورود {abs(ENTRY_OFF)*100:.0f}٪ زون | "
-        f"سقف: هر چارت ۳، کل {MAX_OPEN_TOTAL}"
-    )
+    # پیام راه‌اندازی — با محافظ ضد اسپم: اگر ربات پشت‌سرهم ری‌استارت شود (کرش)،
+    # به‌جای پیام کامل، فقط یک هشدار کوتاه و حداکثر هر ۳۰ دقیقه یک بار می‌رود
+    startup_file = os.path.join(LOG_DIR, "last_startup.txt")
+    since = None
+    try:
+        with open(startup_file, encoding="utf-8") as f:
+            since = (dt.datetime.now() - dt.datetime.fromisoformat(f.read().strip())).total_seconds()
+    except Exception:
+        pass
+    try:
+        with open(startup_file, "w", encoding="utf-8") as f:
+            f.write(dt.datetime.now().isoformat())
+    except Exception:
+        pass
+
+    if since is not None and since < 600:
+        log(f"⚠️ ربات دوباره راه‌اندازی شد ({int(since)} ثانیه بعد از اجرای قبلی) — احتمال کرش! لاگ را چک کن.",
+            bale=(since > 1800))
+    else:
+        bale_send(
+            "🤖 ربات روشن شد\n"
+            f"حساب: {acc.login} ({acc.server}) | {'دمو' if acc.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO else 'واقعی'}\n"
+            f"بالانس: {acc.balance:,.0f} | اکویتی: {acc.equity:,.0f} {acc.currency}\n"
+            f"سبد: {len(symbols)} نماد ({', '.join(symbols)})\n"
+            f"ریسک {RISK_PER_TRADE*100:.1f}٪ | حد سود {RR:g}R | ورود {abs(ENTRY_OFF)*100:.0f}٪ زون | "
+            f"سقف: هر چارت ۳، کل {MAX_OPEN_TOTAL}"
+        )
 
     last_bar = {b: None for b in symbols}
 
