@@ -35,7 +35,7 @@ RR_MODES = {
 DEFAULT_RR = 3.0  # حالت اصلی گزارش‌های کامل
 
 # مقایسه‌ی فیلترهای کیفیت زون (به سبک Odds Enhancers الفونسو) — شیت «مقایسه_کیفیت_زون»
-COMPARE_QUALITY_MODES = True
+COMPARE_QUALITY_MODES = False  # نتیجه: بدون فیلتر کیفیت بهترین بود
 QUALITY_MODES = {
     "مبنا (بدون فیلتر کیفیت)": {},
     "باطل شدن زون شکسته": {"invalidate_on_breach": True},
@@ -83,9 +83,12 @@ PORTFOLIO_SYMBOLS = []              # خالی = همه‌ی نمادها؛ نم
 
 # فایل «جزئیات_حرفه‌ای.xlsx» ساخته بشود یا نه (False = فقط خلاصه؛ سریع‌تر)
 WRITE_DETAILS = False
+# شیت‌های ریز پرتفوی (سالانه/ماهانه) هم نوشته شوند؟ False = خروجی تمیزتر
+WRITE_PORTFOLIO_DETAIL = False
 
 # --- تحلیل سشن‌های معاملاتی (شیت‌های «تحلیل_سشن» و «سشن_هر_نماد») ---
 ANALYZE_SESSIONS = True
+SESSION_STABILITY = True   # تست پایداری: آیا رتبه‌بندی سشن‌ها در هر دو نیمه‌ی دیتا یکسان می‌ماند؟
 # ساعت دیتای بروکر معمولاً UTC+2 یا UTC+3 است. برای تبدیل به UTC این عدد به ساعت‌ها اضافه می‌شود.
 # اگر مطمئن نیستی صفر بگذار و جدول «ساعت خام» را ببین، بعد کالیبره کن.
 SESSION_HOUR_SHIFT = -3   # نمونه: دیتای UTC+3 → -3 برای رسیدن به UTC
@@ -107,7 +110,7 @@ def hour_to_session(h):
 
 # مقایسه‌ی «سقف اجرا» (شبیه ربات لایو): هر چارت حداکثر ۱ ترید باز + سقف کل.
 # نتایج در شیت «مقایسه_سقف_اجرا»
-COMPARE_EXECCAP_MODES = True
+COMPARE_EXECCAP_MODES = False  # نتیجه: «هر چارت ۳ + سقف ۸» انتخاب شد
 EXECCAP_MODES = {
     "بدون محدودیت": (0, 0),          # (سقف کل تریدهای باز, سقف هر چارت)
     "هر چارت 1 + سقف 3": (3, 1),
@@ -1505,6 +1508,49 @@ def session_analysis(trades_df):
     return by_session, by_hour, piv
 
 
+def session_stability(trades_df):
+    """تست پایداری سشن‌ها: دیتا را از وسط دو نیم می‌کند و می‌بیند آیا
+    رتبه‌بندی سشن‌ها در هر دو نیمه یکسان می‌ماند (ضد بهینه‌سازی روی گذشته)."""
+    if trades_df is None or trades_df.empty:
+        return None
+    t = trades_df.copy()
+    t["زمان_ورود"] = pd.to_datetime(t["زمان_ورود"], errors="coerce")
+    t = t.dropna(subset=["زمان_ورود", "نتیجه_R"]).sort_values("زمان_ورود")
+    if len(t) < 20:
+        return None
+
+    t["ساعت_UTC"] = (t["زمان_ورود"].dt.hour + SESSION_HOUR_SHIFT) % 24
+    t["سشن"] = t["ساعت_UTC"].apply(hour_to_session)
+    mid = t["زمان_ورود"].iloc[len(t) // 2]
+    first, second = t[t["زمان_ورود"] < mid], t[t["زمان_ورود"] >= mid]
+
+    rows = []
+    for name in [r[2] for r in SESSION_RANGES]:
+        g1, g2 = first[first["سشن"] == name], second[second["سشن"] == name]
+        if g1.empty and g2.empty:
+            continue
+        a1 = float(g1["نتیجه_R"].mean()) if len(g1) else 0.0
+        a2 = float(g2["نتیجه_R"].mean()) if len(g2) else 0.0
+        s1, s2 = float(g1["نتیجه_R"].sum()), float(g2["نتیجه_R"].sum())
+        if s1 > 0 and s2 > 0:
+            verdict = "✅ پایدار (در هر دو نیمه سودده)"
+        elif s1 < 0 and s2 < 0:
+            verdict = "❌ پایدار (در هر دو نیمه ضررده)"
+        else:
+            verdict = "⚠️ ناپایدار (فقط در یک نیمه سودده)"
+        rows.append({
+            "سشن": name,
+            "نیمه۱_تعداد": len(g1), "نیمه۱_میانگین_R": round(a1, 3), "نیمه۱_مجموع_R": round(s1, 1),
+            "نیمه۲_تعداد": len(g2), "نیمه۲_میانگین_R": round(a2, 3), "نیمه۲_مجموع_R": round(s2, 1),
+            "نتیجه": verdict,
+        })
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values("نیمه۲_مجموع_R", ascending=False)
+        out.attrs["mid"] = str(mid)
+    return out
+
+
 def _aggregate_mode_rows(rows, mode_col):
     """جدول مقایسه‌ی حالت‌ها: ردیف هر نماد + ردیف «کل» برای هر حالت."""
     cmp_df = pd.concat(rows, ignore_index=True)
@@ -2091,10 +2137,15 @@ def main():
                 sess_out.to_excel(sw, sheet_name="تحلیل_سشن", index=False)
                 hour_out.to_excel(sw, sheet_name="تحلیل_ساعت_خام", index=False)
                 sesssym_out.to_excel(sw, sheet_name="سشن_هر_نماد", index=False)
+                if SESSION_STABILITY:
+                    stab = session_stability(trades_df)
+                    if stab is not None:
+                        stab.to_excel(sw, sheet_name="پایداری_سشن", index=False)
             if port is not None:
                 port["stats"].to_excel(sw, sheet_name="پرتفوی", index=False)
-                port["yearly"].to_excel(sw, sheet_name="پرتفوی_سالانه", index=False)
-                port["monthly"].to_excel(sw, sheet_name="پرتفوی_ماهانه", index=False)
+                if WRITE_PORTFOLIO_DETAIL:
+                    port["yearly"].to_excel(sw, sheet_name="پرتفوی_سالانه", index=False)
+                    port["monthly"].to_excel(sw, sheet_name="پرتفوی_ماهانه", index=False)
             if ec_out is not None:
                 ec_out.to_excel(sw, sheet_name="مقایسه_سقف_اجرا", index=False)
             if ll_out is not None:
