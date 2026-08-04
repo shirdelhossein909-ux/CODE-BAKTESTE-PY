@@ -397,12 +397,47 @@ def place_pending(base, broker_name, p):
     return False
 
 
-def cancel_order(base, o, why="طبق قوانین استراتژی دیگر معتبر نیست"):
+def _age_txt(ts):
+    """عمر سفارش را به زبان ساده می‌نویسد."""
+    try:
+        sec = max(0, int(_time.time() - int(ts)))
+    except Exception:
+        return "نامشخص"
+    d, rem = divmod(sec, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d: return f"{d} روز و {h} ساعت"
+    if h: return f"{h} ساعت و {m} دقیقه"
+    return f"{m} دقیقه"
+
+
+def cancel_order(base, o, why="طبق قوانین استراتژی دیگر معتبر نیست",
+                 next_action="دوباره چیده نمی‌شود (زون دیگر معتبر نیست)", filters="", broker_name=None):
+    """لغو سفارش با گزارش مهندسی کامل: مشخصات سفارش، دلیل دقیق، وضعیت بازار و اقدام بعدی."""
+    side = "خرید" if o.type in (mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_BUY_STOP) else "فروش"
+    price_now = ""
+    try:
+        tk = mt5.symbol_info_tick(broker_name or o.symbol)
+        if tk is not None:
+            price_now = f" | قیمت فعلی: {tk.bid}"
+    except Exception:
+        pass
+
     res = mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
     if res is not None and res.retcode == mt5.TRADE_RETCODE_DONE:
-        log(f"🗑️ سفارش لغو شد | زون {o.comment} | دلیل: {why}", base)
+        lines = [
+            f"🗑️ سفارش لغو شد | زون {o.comment} | {side} | تیکت {o.ticket}",
+            f"    ├ مشخصات: ورود {o.price_open} | استاپ {o.sl} | تارگت {o.tp} | حجم {o.volume_current} لات",
+            f"    ├ عمر سفارش: {_age_txt(o.time_setup)}{price_now}",
+            f"    ├ دلیل دقیق: {why}",
+        ]
+        if filters:
+            lines.append(f"    ├ وضعیت فیلترها: {filters}")
+        lines.append(f"    └ اقدام بعدی: {next_action}")
+        log("\n".join(lines), base)
     else:
-        log(f"⚠️ لغو سفارش {o.ticket} (زون {o.comment}) موفق نبود: {getattr(res, 'retcode', mt5.last_error())}", base)
+        log(f"⚠️ لغو سفارش {o.ticket} (زون {o.comment}) موفق نبود | کد: "
+            f"{getattr(res, 'retcode', mt5.last_error())} | دلیلی که می‌خواستیم لغو کنیم: {why}", base)
 
 
 _last_note = {}   # آخرین پیام وضعیت هر نماد — برای جلوگیری از تکرار
@@ -415,6 +450,7 @@ def sync_all(symbols, reason_txt="بازبینی"):
     # ۱) خواسته‌های استراتژی برای هر نماد (به ترتیب اولویت خود نماد)
     all_wanted = {}
     notes = {}
+    filters_txt = {}
     zone_reasons = {}
     for b, name in symbols.items():
         try:
@@ -426,6 +462,7 @@ def sync_all(symbols, reason_txt="بازبینی"):
             continue
         all_wanted[b] = list(st["pending"]) + list(st.get("armed", []))
         notes[b] = st.get("دلیل_نبود", "") or st.get("فیلتر_توضیح", "")
+        filters_txt[b] = st.get("فیلتر_توضیح", "")
         zone_reasons[b] = st.get("دلایل_زون", {})
 
     # ۲) سهمیه‌بندی منصفانه (طبق نتیجه‌ی بک‌تست «هر چارت ۳ + سقف ۸»):
@@ -451,12 +488,15 @@ def sync_all(symbols, reason_txt="بازبینی"):
                 zr = zone_reasons.get(b, {}).get(str(cm), "")
                 still_wanted = any(str(p["zone_id"]) == str(cm) for p in all_wanted.get(b, []))
                 if zr:
-                    why = zr
+                    why, nxt = zr, "دوباره چیده نمی‌شود (زون طبق قوانین استراتژی باطل شد)"
                 elif still_wanted:
-                    why = f"زون هنوز معتبر است ولی سهمیه‌ی اوردر (سقف {MAX_PENDING_TOTAL} کل حساب) پر شد"
+                    why = f"زون معتبر است ولی سهمیه‌ی اوردر پر شد (سقف {MAX_PENDING_TOTAL} اوردر در کل حساب)"
+                    nxt = "به‌محض آزاد شدن سهمیه، دوباره چیده می‌شود"
                 else:
-                    why = f"دیگر در فهرست زون‌های معتبر نیست ({notes.get(b, 'شرایط عوض شد')})"
-                cancel_order(b, o, why=why)
+                    why = f"دیگر در فهرست زون‌های معتبر نیست — {notes.get(b, 'شرایط بازار عوض شد')}"
+                    nxt = "اگر شرایط دوباره سبز شود و زون معتبر بماند، دوباره بررسی می‌شود"
+                cancel_order(b, o, why=why, next_action=nxt,
+                             filters=filters_txt.get(b, ""), broker_name=name)
 
         # اگر وزن سشن عوض شده باشد، سفارش موجود با حجم متناسبِ سشن جدید دوباره چیده می‌شود
         if SESSION_REPLACE_ORDERS and USE_SESSION_WEIGHTS:
@@ -474,7 +514,11 @@ def sync_all(symbols, reason_txt="بازبینی"):
                 if target is None or o.volume <= 0:
                     continue
                 if abs(target - o.volume) / o.volume > SESSION_REPLACE_TOLERANCE:
-                    cancel_order(b, o, why=f"وزن سشن عوض شد ({sess_now} × {w_now:g}) — با حجم جدید چیده می‌شود")
+                    cancel_order(b, o,
+                                 why=f"وزن ریسک سشن عوض شد → سشن فعلی: {sess_now} (ضریب {w_now:g}) | "
+                                     f"حجم فعلی {o.volume_current} → حجم درست {target}",
+                                 next_action="بلافاصله با حجم متناسب سشن جدید دوباره چیده می‌شود",
+                                 filters=filters_txt.get(b, ""), broker_name=name)
                     existing.pop(cm, None)
 
         placed_something = False
@@ -753,7 +797,8 @@ def enforce_open_cap(symbols_rev):
             log(f"🚧 سقف {MAX_OPEN_TOTAL} ترید باز پر شد — {len(my_orders)} اوردر در انتظار موقتاً جمع می‌شود.")
             for o in my_orders:
                 cancel_order(symbols_rev.get(o.symbol, o.symbol), o,
-                             why=f"سقف {MAX_OPEN_TOTAL} ترید باز پر است (بعداً دوباره چیده می‌شود)")
+                             why=f"سقف {MAX_OPEN_TOTAL} تریدِ بازِ هم‌زمان پر شد — برای کنترل ریسک کل حساب",
+                             next_action=f"به‌محض اینکه تعداد تریدهای باز زیر {MAX_OPEN_TOTAL} برگردد، دوباره چیده می‌شود")
         _cap_active = True
         return "capped"
 
