@@ -405,6 +405,8 @@ def cancel_order(base, o, why="طبق قوانین استراتژی دیگر م�
         log(f"⚠️ لغو سفارش {o.ticket} (زون {o.comment}) موفق نبود: {getattr(res, 'retcode', mt5.last_error())}", base)
 
 
+_last_note = {}   # آخرین پیام وضعیت هر نماد — برای جلوگیری از تکرار
+
 def sync_all(symbols, reason_txt="بازبینی"):
     """بازپخش استراتژی روی همه‌ی نمادها + سهمیه‌بندی منصفانه‌ی اوردرها:
     دور اول به هر نماد یک اوردر (بهترین زونش)، بعد دور دوم و سوم —
@@ -485,7 +487,7 @@ def sync_all(symbols, reason_txt="بازبینی"):
             if place_pending(b, name, p):
                 placed_something = True
 
-        # گزارش وضعیت هر چارت — همیشه، با دلیل دقیق
+        # گزارش وضعیت هر چارت — فقط وقتی وضعیت نسبت به دفعه‌ی قبل عوض شده باشد
         note = notes.get(b, "")
         n_open_sym = len([p for p in my_positions if p.symbol == name])
         if not all_wanted.get(b):
@@ -493,12 +495,21 @@ def sync_all(symbols, reason_txt="بازبینی"):
                 why = "فیلترها سبزند ولی زون معتبرِ لمس‌نشده‌ای نزدیک قیمت نیست"
             else:
                 why = note
-            log(f"⛔ معامله نمی‌کند | دلیل: {why} | اوردر فعال: {len(existing)} | ترید باز: {n_open_sym}", b)
+            msg = f"⛔ معامله نمی‌کند | دلیل: {why} | اوردر فعال: {len(existing)} | ترید باز: {n_open_sym}"
         elif not desired:
-            log(f"⏸️ زون آماده دارد ولی سهمیه‌ی اوردر (سقف {MAX_PENDING_TOTAL} کل حساب) پر است | "
-                f"زون‌های واجد شرایط: {len(all_wanted.get(b, []))}", b)
+            msg = (f"⏸️ زون آماده دارد ولی سهمیه‌ی اوردر (سقف {MAX_PENDING_TOTAL} کل حساب) پر است | "
+                   f"زون‌های واجد شرایط: {len(all_wanted.get(b, []))}")
         elif not placed_something:
-            log(f"✔️ بدون تغییر | اوردر فعال: {len(existing)} | ترید باز: {n_open_sym} | وضعیت فیلترها: {note}", b)
+            msg = f"✔️ بدون تغییر | اوردر فعال: {len(existing)} | ترید باز: {n_open_sym} | وضعیت فیلترها: {note}"
+        else:
+            msg = None
+
+        if msg is not None:
+            if _last_note.get(b) != msg:
+                _last_note[b] = msg
+                log(msg, b)
+            else:
+                console(f"{b} | (بدون تغییر) {msg}")   # فقط در CMD، نه در بله
 
     log(f"همگام‌سازی کامل شد ({reason_txt}) | اوردرهای تخصیص‌یافته: {total} از سقف {MAX_PENDING_TOTAL}")
 
@@ -508,6 +519,26 @@ def console(msg):
     """چاپ فقط در CMD (بدون نوشتن در فایل — که فایل لاگ شلوغ نشود)."""
     stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{stamp}] {msg}", flush=True)
+
+
+_market_closed = [False]
+
+def market_is_open(symbols):
+    """تشخیص باز/بسته بودن بازار از روی تازگی آخرین تیک قیمت.
+    اگر برای همه‌ی نمادها بیش از ۵ دقیقه تیک نیامده باشد، بازار تعطیل است."""
+    now = _time.time()
+    fresh = 0
+    checked = 0
+    for name in symbols.values():
+        tk = mt5.symbol_info_tick(name)
+        if tk is None or tk.time == 0:
+            continue
+        checked += 1
+        if now - tk.time < 300:
+            fresh += 1
+    if checked == 0:
+        return True   # نتوانستیم بسنجیم → مانع کار نمی‌شویم
+    return fresh > 0
 
 
 def health_check():
@@ -950,6 +981,21 @@ def main():
             elif _last_problems[0]:
                 _last_problems[0] = set()
                 log("🟢 مشکل برطرف شد — همه‌چیز دوباره سالم است و ربات ادامه می‌دهد.")
+
+            # بازار تعطیل؟ فقط یک بار اعلام کن و منتظر بمان
+            if not market_is_open(symbols):
+                if not _market_closed[0]:
+                    _market_closed[0] = True
+                    log("🌙 بازار تعطیل است — ربات بیدار است و منتظر باز شدن بازار می‌ماند "
+                        "(سفارش‌ها و پوزیشن‌ها دست‌نخورده‌اند).")
+                heartbeat("بازار تعطیل — منتظر")
+                console("🌙 بازار تعطیل است | ربات سالم و در حال انتظار")
+                _time.sleep(POLL_SECONDS)
+                continue
+            elif _market_closed[0]:
+                _market_closed[0] = False
+                log("☀️ بازار باز شد — ربات دوباره شروع به کار کرد.")
+                sync_all(symbols, "باز شدن بازار")
 
             cap_state = enforce_open_cap(symbols_rev)
             if cap_state == "resync":
