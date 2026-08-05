@@ -511,9 +511,11 @@ def sync_all(symbols, reason_txt="بازبینی"):
                 target, _ = calc_volume(name, si_, p["direction"],
                                         round(p["entry"], si_.digits), round(p["sl"], si_.digits),
                                         risk_amt_, acc_.equity)
-                if target is None or o.volume <= 0:
+                # توجه: در متاتریدر، «سفارش» فیلد volume_current دارد و «پوزیشن» فیلد volume
+                cur_vol = float(getattr(o, "volume_current", 0) or 0)
+                if target is None or cur_vol <= 0:
                     continue
-                if abs(target - o.volume) / o.volume > SESSION_REPLACE_TOLERANCE:
+                if abs(target - cur_vol) / cur_vol > SESSION_REPLACE_TOLERANCE:
                     cancel_order(b, o,
                                  why=f"وزن ریسک سشن عوض شد → سشن فعلی: {sess_now} (ضریب {w_now:g}) | "
                                      f"حجم فعلی {o.volume_current} → حجم درست {target}",
