@@ -104,6 +104,24 @@ LIVE_START_EQUITY = 100000.0
 LIVE_BASKET_ORDER = ["XAUUSD", "AUDJPY", "AUDUSD", "CHFJPY", "EURCAD", "EURNZD",
                      "GBPJPY", "GBPNZD", "NZDCAD", "NZDUSD", "USDCAD", "USDCHF"]
 
+# ============================================================================
+# تست پایداری نمادها — «آیا لبه‌ی این نماد واقعی است یا شانسی؟»
+# ============================================================================
+# تست ۱ (رایگان): بازه به دو نیمه تقسیم می‌شود و کارنامه‌ی هر نماد در هر نیمه
+# جدا گزارش می‌شود. نمادی که فقط در یک نیمه خوب بوده، لبه‌ی واقعی ندارد.
+# خروجی: شیت «پایداری_نماد»
+STABILITY_TEST = True
+STABILITY_MIN_TRADES = 20   # کمتر از این تعداد در یک نیمه = نمونه‌ی کم، قضاوت نکن
+
+# تست ۲ (گران): هر بار یک نماد از سبد برداشته می‌شود و کل بک‌تست دوباره اجرا
+# می‌گردد تا ببینیم حساب بدون آن نماد بهتر می‌شود یا بدتر. چون نمادها سر ۸ جای
+# سفارش با هم رقابت می‌کنند، حذف یک نماد جا را به بقیه می‌دهد — این تنها راهِ
+# درستِ جواب دادن به «حذفش کنم یا نه؟» است.
+# ⚠️ زمان‌بر: (تعداد نمادها + ۱) برابر یک اجرای کامل. برای ۱۲ نماد و دیتای ۶ ساله
+#    حدود ۷۵ دقیقه. فقط وقتی روشنش کن که وقت داری.
+# خروجی: شیت «حذف_تک‌نماد»
+LEAVE_ONE_OUT_TEST = False
+
 # فایل «جزئیات_حرفه‌ای.xlsx» ساخته بشود یا نه (False = فقط خلاصه؛ سریع‌تر)
 WRITE_DETAILS = False
 # شیت‌های ریز پرتفوی (سالانه/ماهانه) هم نوشته شوند؟ False = خروجی تمیزتر
@@ -2057,6 +2075,113 @@ def live_book_report(book, trades_df, alloc_df=None):
             "monthly": _period_returns("M").rename(columns={"دوره": "ماه"})}
 
 
+def stability_split_test(trades_df, min_trades=None):
+    """تست پایداری: کارنامه‌ی هر نماد در نیمه‌ی اول در برابر نیمه‌ی دوم بازه.
+
+    چرا مهم است؟ نمادی که کل سودش از یک دوره‌ی خوش‌شانس آمده، در نیمه‌ی دیگر
+    ضررده است. چنین نمادی لبه‌ی واقعی ندارد و اعتماد به آن یعنی برازش به گذشته.
+
+    فقط از «میانگین R» و «فاکتور سود» قضاوت می‌کنیم چون مستقل از اندازه‌ی حساب‌اند
+    (سود دلاری با بزرگ شدن حساب رشد می‌کند و نیمه‌ی دوم را الکی برنده نشان می‌دهد).
+    """
+    if trades_df is None or trades_df.empty:
+        return None
+    min_trades = STABILITY_MIN_TRADES if min_trades is None else min_trades
+
+    t = trades_df.copy()
+    t["زمان_ورود"] = pd.to_datetime(t["زمان_ورود"], errors="coerce")
+    t = t.dropna(subset=["زمان_ورود"])
+    if t.empty:
+        return None
+
+    t0, t1 = t["زمان_ورود"].min(), t["زمان_ورود"].max()
+    mid = t0 + (t1 - t0) / 2
+
+    def half_stats(g):
+        if g.empty:
+            return dict(تعداد=0, درصد_برد=0.0, میانگین_R=0.0, فاکتور_سود=0.0, جمع_R=0.0)
+        r = g["نتیجه_R"].astype(float)
+        win = float(r[r > 0].sum())
+        los = float(r[r < 0].abs().sum())
+        return dict(تعداد=int(len(r)),
+                    درصد_برد=round(float((r > 0).mean() * 100.0), 2),
+                    میانگین_R=round(float(r.mean()), 3),
+                    فاکتور_سود=round(win / los, 3) if los > 0 else 999.0,
+                    جمع_R=round(float(r.sum()), 2))
+
+    rows = []
+    for sym, g in t.groupby("نماد"):
+        a = half_stats(g[g["زمان_ورود"] < mid])
+        b = half_stats(g[g["زمان_ورود"] >= mid])
+
+        if a["تعداد"] < min_trades or b["تعداد"] < min_trades:
+            verdict = "نمونه‌ی کم — قضاوت نکن"
+        elif a["میانگین_R"] > 0 and b["میانگین_R"] > 0:
+            verdict = "پایدار ✅"
+        elif a["میانگین_R"] <= 0 and b["میانگین_R"] <= 0:
+            verdict = "در هر دو نیمه ضررده ❌"
+        elif b["میانگین_R"] > 0:
+            verdict = "فقط نیمه‌ی دوم خوب بود ⚠️"
+        else:
+            verdict = "فقط نیمه‌ی اول خوب بود ⚠️"
+
+        rows.append({
+            "نماد": sym,
+            "نیمه۱_تعداد": a["تعداد"], "نیمه۱_برد٪": a["درصد_برد"],
+            "نیمه۱_میانگین_R": a["میانگین_R"], "نیمه۱_فاکتور_سود": a["فاکتور_سود"],
+            "نیمه۲_تعداد": b["تعداد"], "نیمه۲_برد٪": b["درصد_برد"],
+            "نیمه۲_میانگین_R": b["میانگین_R"], "نیمه۲_فاکتور_سود": b["فاکتور_سود"],
+            "اختلاف_میانگین_R": round(b["میانگین_R"] - a["میانگین_R"], 3),
+            "حکم": verdict,
+        })
+
+    out = pd.DataFrame(rows).sort_values("نیمه۲_میانگین_R", ascending=False)
+    out.insert(0, "مرز_دو_نیمه", mid.strftime("%Y-%m-%d"))
+    return out.reset_index(drop=True)
+
+
+def leave_one_out_test(frames, spreads, **kw):
+    """تست حذف تک‌نماد: حساب بدون هر نماد چقدر بهتر/بدتر می‌شود؟
+
+    چون نمادها سر ۸ جای سفارش با هم رقابت می‌کنند، حذف یک نماد فقط معاملاتش را
+    کم نمی‌کند — جای خالی‌اش به بقیه می‌رسد. پس تنها راه درست این است که کل
+    بک‌تست بدون آن نماد دوباره اجرا شود.
+    """
+    def run(fr, label):
+        _res, bk, _al = portfolio_live_replay(fr, spreads, **kw)
+        tr = [r[2] for r in _res.values() if r[2] is not None and not r[2].empty]
+        n = int(sum(len(x) for x in tr))
+        return {"حالت": label,
+                "بازده٪": round((bk.equity / bk.start_equity - 1.0) * 100.0, 2),
+                "حداکثر_افت٪": round(bk.max_dd * 100.0, 2),
+                "تعداد_معامله": n}
+
+    print("   [۰/%d] سبد کامل..." % len(frames))
+    base = run(frames, "سبد کامل (مبنا)")
+    rows = [base]
+
+    for i, sym in enumerate(list(frames.keys()), start=1):
+        print(f"   [{i}/{len(frames)}] بدون {sym}...")
+        sub = {k: v for k, v in frames.items() if k != sym}
+        if not sub:
+            continue
+        r = run(sub, f"بدون {sym}")
+        r["Δبازده٪"] = round(r["بازده٪"] - base["بازده٪"], 2)
+        r["Δافت٪"] = round(r["حداکثر_افت٪"] - base["حداکثر_افت٪"], 2)
+        # بهتر = هم بازده بالاتر هم افت کمتر (یا یکی خیلی بهتر و دیگری بدتر نشده)
+        if r["Δبازده٪"] > 0 and r["Δافت٪"] <= 0:
+            r["حکم"] = "حذفش حساب را بهتر می‌کند ✅"
+        elif r["Δبازده٪"] < 0 and r["Δافت٪"] >= 0:
+            r["حکم"] = "حذفش حساب را بدتر می‌کند ❌"
+        else:
+            r["حکم"] = "مبادله (یکی بهتر، یکی بدتر) ⚖️"
+        rows.append(r)
+
+    out = pd.DataFrame(rows)
+    cols = ["حالت", "تعداد_معامله", "بازده٪", "Δبازده٪", "حداکثر_افت٪", "Δافت٪", "حکم"]
+    return out[[c for c in cols if c in out.columns]]
+
+
 def main():
     version_name = os.path.basename(os.getcwd())
     outdir = os.path.join(os.getcwd(), "خروجی")
@@ -2446,6 +2571,30 @@ def main():
                 print("⚠️ تحلیل سشن ناموفق بود:", str(e))
 
         # --- شبیه‌سازی حساب مشترک (پرتفوی) ---
+        # --- تست پایداری نمادها (نیمه‌ی اول در برابر نیمه‌ی دوم) ---
+        stab_out = None
+        if STABILITY_TEST:
+            try:
+                stab_out = stability_split_test(trades_df)
+                if stab_out is not None:
+                    bad = stab_out[stab_out["حکم"].str.contains("ضررده|فقط نیمه", na=False)]
+                    print(f"🧪 تست پایداری: {len(stab_out)} نماد بررسی شد | "
+                          f"{len(bad)} نماد لبه‌ی ناپایدار دارد (شیت «پایداری_نماد»)")
+            except Exception as e:
+                print("⚠️ تست پایداری ناموفق بود:", str(e))
+
+        # --- تست حذف تک‌نماد (زمان‌بر) ---
+        loo_out = None
+        if LEAVE_ONE_OUT_TEST and LIVE_MODE:
+            try:
+                print(f"\n🧪 تست حذف تک‌نماد: {len(frames)+1} اجرای کامل — این چند ده دقیقه طول می‌کشد...")
+                loo_out = leave_one_out_test(
+                    frames, spreads, entry_off=DEFAULT_ENTRY_OFF, sl_off=DEFAULT_SL_OFF,
+                    rr=DEFAULT_RR, manage_mode=DEFAULT_MANAGE, min_risk_atr=DEFAULT_MIN_RISK_ATR)
+                print("   تمام شد (شیت «حذف_تک‌نماد»)")
+            except Exception as e:
+                print("⚠️ تست حذف تک‌نماد ناموفق بود:", str(e))
+
         port = None
         try:
             if LIVE_MODE and live_book is not None:
@@ -2531,6 +2680,10 @@ def main():
 
         with pd.ExcelWriter(summary_path, engine="openpyxl") as sw:
             summary_out.to_excel(sw, sheet_name="خلاصه", index=False)
+            if stab_out is not None:
+                stab_out.to_excel(sw, sheet_name="پایداری_نماد", index=False)
+            if loo_out is not None:
+                loo_out.to_excel(sw, sheet_name="حذف_تک‌نماد", index=False)
             if cmp_out is not None:
                 cmp_out.to_excel(sw, sheet_name="مقایسه_نقطه_ورود", index=False)
             if rr_out is not None:
