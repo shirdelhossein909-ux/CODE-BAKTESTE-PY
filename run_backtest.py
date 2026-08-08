@@ -81,6 +81,27 @@ PORTFOLIO_MAX_OPEN = 5              # حداکثر پوزیشن باز هم‌ز
 PORTFOLIO_RISK_PER_TRADE = 0.005    # ریسک هر معامله از اکویتی حساب (0.005 = نیم درصد، 0.01 = یک درصد)
 PORTFOLIO_SYMBOLS = []              # خالی = همه‌ی نمادها؛ نمونه: ["AUDCAD","EURUSD","CHFJPY","XAUUSD","GBPCAD"]
 
+# ============================================================================
+# حالت «عین لایو» — همه‌ی نمادها هم‌زمان روی یک حساب، دقیقاً مثل sync_all ربات
+# ============================================================================
+# در حالت قدیمی هر نماد جدا بک‌تست می‌شد (سقف ۳ سفارش فقط داخل همان نماد) و سقف
+# کل حساب بعداً در portfolio_replay روی فهرست آماده اعمال می‌شد. نتیجه‌اش این بود
+# که بک‌تست عملاً اجازه‌ی ۱۲×۳ = ۳۶ سفارش هم‌زمان می‌داد ولی ربات فقط ۸ تا.
+# در این حالت، موتور همه‌ی نمادها را کندل‌به‌کندل با هم جلو می‌برد و سهمیه‌بندی
+# دوریِ (round-robin) ربات را عیناً اجرا می‌کند.
+LIVE_MODE = True                    # True = شبیه‌سازی عین لایو (توصیه‌شده)
+LIVE_MAX_PENDING_TOTAL = 8          # سقف سفارش پندینگ کل حساب — برابر MAX_PENDING_TOTAL ربات
+LIVE_MAX_OPEN_TOTAL = 8             # سقف پوزیشن باز کل حساب — برابر MAX_OPEN_TOTAL ربات
+LIVE_MAX_PENDING_PER_SYMBOL = 3     # سقف سفارش هر نماد — برابر حلقه‌ی range(3) ربات
+LIVE_ARM_UNTOUCHED = True           # چیدن سفارش روی زون‌های لمس‌نشده — عین فهرست armed ربات
+LIVE_RISK_PER_TRADE = 0.005         # ریسک هر معامله — برابر RISK_PER_TRADE ربات
+LIVE_RESERVE = 0.15                 # سرمایه‌ی رزرو — برابر RESERVE ربات
+LIVE_START_EQUITY = 100000.0
+# ترتیب نمادها در سهمیه‌بندی دوری — باید عیناً همان ترتیب BASKET در live_trader.py باشد
+# (نماد اول در هر دور اولویت دارد، پس ترتیب روی نتیجه اثر دارد)
+LIVE_BASKET_ORDER = ["XAUUSD", "AUDJPY", "AUDUSD", "CHFJPY", "EURCAD", "EURNZD",
+                     "GBPJPY", "GBPNZD", "NZDCAD", "NZDUSD", "USDCAD", "USDCHF"]
+
 # فایل «جزئیات_حرفه‌ای.xlsx» ساخته بشود یا نه (False = فقط خلاصه؛ سریع‌تر)
 WRITE_DETAILS = False
 # شیت‌های ریز پرتفوی (سالانه/ماهانه) هم نوشته شوند؟ False = خروجی تمیزتر
@@ -542,13 +563,61 @@ def log_event(events, t, symbol, zid, etype, detail=""):
     })
 
 # ---------------- Backtest (logic unchanged; reporting upgraded) ----------------
-def backtest_one(symbol, h4, d1, w1, years, spread,
-                 entry_off=0.10, sl_off=0.25, rr=3.0,
-                 reserve=0.15, risk_per_trade=0.01, max_orders=3,
-                 m15=None, min_risk_atr=0.0, dist_cancel_r=0.0, manage_mode="none",
-                 max_open_per_symbol=0,
-                 invalidate_on_breach=False, min_profit_margin_r=0.0, min_departure_atr=0.0,
-                 retry_rejected_zones=False, return_state=False):
+class AccountBook:
+    """حساب مشترک همه‌ی نمادها در حالت «عین لایو».
+
+    اکویتی، تعداد پوزیشن باز کل حساب و افت سرمایه اینجا نگه داشته می‌شود تا همه‌ی
+    نمادها روی یک حساب واقعی معامله کنند — نه هرکدام روی حساب فرضی خودش.
+    """
+
+    def __init__(self, start_equity=100000.0, reserve=0.15, risk_per_trade=0.005,
+                 session_weights=None, max_open_total=8):
+        self.equity = float(start_equity)
+        self.start_equity = float(start_equity)
+        self.peak = float(start_equity)
+        self.max_dd = 0.0
+        self.reserve = float(reserve)
+        self.risk_per_trade = float(risk_per_trade)
+        self.session_weights = session_weights or {}
+        self.max_open_total = int(max_open_total)
+        self.open_total = 0
+        self.equity_curve = []   # (زمان، اکویتی) بعد از هر معامله‌ی بسته‌شده
+
+    def session_weight(self, t):
+        if not self.session_weights:
+            return 1.0
+        try:
+            hr = (pd.Timestamp(t).hour + SESSION_HOUR_SHIFT) % 24
+        except Exception:
+            return 1.0
+        return float(self.session_weights.get(hour_to_session(hr), 1.0))
+
+    def risk_amount(self, t):
+        return self.equity * (1.0 - self.reserve) * self.risk_per_trade * self.session_weight(t)
+
+    def apply_result(self, t, risk_amt, result_r):
+        self.equity += float(risk_amt) * float(result_r)
+        self.peak = max(self.peak, self.equity)
+        if self.peak > 0:
+            self.max_dd = max(self.max_dd, (self.peak - self.equity) / self.peak)
+        self.equity_curve.append((t, self.equity))
+
+
+def _backtest_core(symbol, h4, d1, w1, years, spread,
+                   entry_off=0.10, sl_off=0.25, rr=3.0,
+                   reserve=0.15, risk_per_trade=0.01, max_orders=3,
+                   m15=None, min_risk_atr=0.0, dist_cancel_r=0.0, manage_mode="none",
+                   max_open_per_symbol=0,
+                   invalidate_on_breach=False, min_profit_margin_r=0.0, min_departure_atr=0.0,
+                   retry_rejected_zones=False, return_state=False,
+                   book=None, alloc_mode=False, arm_untouched_zones=False):
+    """موتور استراتژی برای یک نماد — به‌صورت generator.
+
+    در هر کندل، درست سر جایی که ربات لایو تصمیم می‌گیرد کدام سفارش‌ها روی حساب
+    بمانند، این تابع «فهرست خواسته‌هایش» را yield می‌کند و منتظر می‌ماند تا راننده
+    (portfolio_live_replay) بگوید چند سهمیه گرفته است. اگر alloc_mode خاموش باشد
+    هیچ‌وقت yield نمی‌کند و رفتارش دقیقاً مثل قبل است.
+    """
 
     bt_start = BACKTEST_START
 
@@ -633,6 +702,8 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
         "رد_به_خاطر_زون_کوچک": 0,
         "رد_به_خاطر_سقف_سفارش": 0,
         "رد_به_خاطر_سقف_پوزیشن_نماد": 0,
+        "لغو_به_خاطر_سهمیه_کل_حساب": 0,
+        "رد_به_خاطر_سقف_پوزیشن_کل_حساب": 0,
         "لغو_به_خاطر_هفتگی": 0,
         "لغو_به_خاطر_دور_شدن": 0,
         "لغو_به_خاطر_تست_سوم": 0,
@@ -763,6 +834,10 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
             nights = 0
         result_r = float(result_r) - (commission_cost + swap_per_night * nights) / risk
 
+        if book is not None:
+            # حساب مشترک: اکویتی و افت سرمایه در سطح کل حساب به‌روز می‌شود
+            book.apply_result(exit_time, pos["risk_amt"], result_r)
+            book.open_total = max(0, book.open_total - 1)
         equity += pos["risk_amt"] * float(result_r)
         peak=max(peak,equity)
         dd=(peak-equity)/peak if peak>0 else 0.0
@@ -936,7 +1011,10 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
                 set_final(zone_df, z.zone_id, "منقضی شد", "Touch2 تا ۵۰ کندل نیامد", t)
                 log_event(events, t, symbol, z.zone_id, "Expired", "")
 
-        # ---------- place orders (همان) ----------
+        # ---------- انتخاب زون‌های واجد شرایط (کاندیدای سفارش) ----------
+        # زون‌هایی که از همه‌ی فیلترها رد شده‌اند اینجا فقط «کاندید» می‌شوند؛
+        # اینکه واقعاً سفارششان روی حساب برود یا نه، به سهمیه بستگی دارد.
+        candidates = []
         for z in h_z:
             if z.created_time>=t or z.expired or id(z) in used:
                 continue
@@ -966,11 +1044,10 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
                 log_event(events, t, symbol, z.zone_id, "Rejected", "روند")
                 used.add(id(z)); continue
 
-            if len([p for p in pending if p["active"] and not p["filled"]]) >= max_orders:
-                reasons["رد_به_خاطر_سقف_سفارش"] += 1
-                set_final(zone_df, z.zone_id, "رد شد", "سقف سفارش هم‌زمان", t)
-                log_event(events, t, symbol, z.zone_id, "Rejected", "سقف سفارش")
-                used.add(id(z)); continue
+            # نکته: سقف سفارش هم‌زمان اینجا اعمال نمی‌شود. در ربات لایو هم زونی که
+            # فقط به‌خاطر پر بودن سهمیه جا نماند، «باطل» نمی‌شود بلکه در فهرست
+            # خواسته‌ها می‌ماند و به‌محض آزاد شدن سهمیه دوباره چیده می‌شود.
+            # اعمال سقف در بخش سهمیه‌بندی پایین‌تر انجام می‌گیرد.
 
             # حاشیه‌ی سود (Odds Enhancer): حرکت اولیه‌ی زون باید حداقل N برابر ریسک جا داده باشد
             if min_profit_margin_r > 0:
@@ -1007,11 +1084,74 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
                     log_event(events, t, symbol, z.zone_id, "Rejected", "SmallZone")
                     used.add(id(z)); continue
 
-            test_no = 1 if z.touch_count==1 else 2
+            candidates.append((z, 1 if z.touch_count==1 else 2))
+
+        # ---------- سفارش‌های «از پیش چیده» روی زون‌های لمس‌نشده ----------
+        # ربات لایو فقط کندل‌های بسته‌شده را می‌بیند، پس اگر منتظر لمس زون بماند
+        # ورودهای داخل کندل را از دست می‌دهد. برای همین روی نزدیک‌ترین زون‌های
+        # لمس‌نشده هم از قبل لیمیت می‌گذارد (فهرست armed در replay_state).
+        # این سفارش‌ها جای واقعی از سقف حساب اشغال می‌کنند — بدون مدل کردنشان
+        # بک‌تست خیلی خوش‌بینانه می‌شود.
+        armed_cands = []
+        if arm_untouched_zones and not (drg or hrg or dtr == 0 or htr == 0 or dtr != htr):
+            wz_arm = [wz for wz in w_z
+                      if wz.created_time + pd.Timedelta(days=7) <= t
+                      and (wz.superseded_time is None or t < wz.superseded_time)]
+            for z in h_z:
+                if z.created_time >= t or z.expired or id(z) in used:
+                    continue
+                if z.superseded_time is not None and t >= z.superseded_time:
+                    continue
+                if z.touch_count != 0:
+                    continue
+                opp_dir = "SELL" if z.direction == "BUY" else "BUY"
+                if any(body_overlaps_zone(o_prev, c_prev, wz) for wz in wz_arm if wz.direction == opp_dir):
+                    continue
+                if z.high() - z.low() <= 0:
+                    continue
+                armed_cands.append((z, 1))
+            armed_cands.sort(key=lambda zc: abs(c - zc[0].proximal))
+
+        # ---------- سهمیه‌بندی سفارش‌ها — عین sync_all ربات ----------
+        # فهرست خواسته‌های این نماد به همان ترتیب اولویت ربات:
+        # اول سفارش‌های روی حساب (جایشان را نگه می‌دارند)، بعد زون‌های لمس‌شده،
+        # و در آخر زون‌های لمس‌نشده به ترتیب نزدیکی به قیمت.
+        candidates.sort(key=lambda zc: abs(c - zc[0].proximal))
+        candidates = candidates + armed_cands
+        live_pending = [p for p in pending if p["active"] and not p["filled"]]
+        n_wanted = len(live_pending) + len(candidates)
+
+        if alloc_mode:
+            # منتظر راننده می‌مانیم تا بگوید چند سهمیه از سقف کل حساب گرفته‌ایم
+            n_slots = yield {"نماد": symbol, "t": t, "خواسته": n_wanted,
+                            "روی_حساب": len(live_pending)}
+            n_slots = int(n_slots or 0)
+        else:
+            n_slots = max_orders
+        n_slots = max(0, min(n_slots, max_orders))
+
+        # سفارش‌هایی که سهمیه‌شان را از دست داده‌اند برداشته می‌شوند (زون سالم می‌ماند)
+        for p in live_pending[n_slots:]:
+            p["active"] = False
+            p["cancel"] = "لغو: سهمیه‌ی سفارش کل حساب پر شد"
+            reasons["لغو_به_خاطر_سهمیه_کل_حساب"] += 1
+            used.discard(id(p["z"]))
+            set_final(zone_df, p["z"].zone_id, "لغو شد",
+                      f"سهمیه‌ی سفارش پر بود (سقف {LIVE_MAX_PENDING_TOTAL} کل حساب)", t)
+            log_event(events, t, symbol, p["z"].zone_id, "Canceled", "QuotaFull")
+
+        free = max(0, n_slots - min(len(live_pending), n_slots))
+        for z, test_no in candidates[:free]:
+            # در ربات، وقتی سقف پوزیشن باز کل حساب پر باشد سفارش تازه گذاشته نمی‌شود
+            if book is not None and book.open_total >= book.max_open_total:
+                reasons["رد_به_خاطر_سقف_پوزیشن_کل_حساب"] += 1
+                continue
             pending.append(make_order(z, t, test_no))
             set_final(zone_df, z.zone_id, "سفارش ثبت شد", "در انتظار پر شدن", t)
             log_event(events, t, symbol, z.zone_id, "OrderPlaced", f"تست={test_no}")
             used.add(id(z))
+        for z, _tn in candidates[free:]:
+            reasons["رد_به_خاطر_سقف_سفارش"] += 1
 
         # ---------- weekly cancel BEFORE fill (همان) ----------
         # زون هفتگی فقط بعد از بسته‌شدن کندل هفتگیِ تأیید (حدود ۷ روز بعد) معتبر است
@@ -1077,8 +1217,13 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
             zone_df.loc[zone_df["ZoneID"]==p["z"].zone_id, "زمان_پرشدن"] = t
             log_event(events, t, symbol, p["z"].zone_id, "Filled", "")
 
-            usable = equity*(1.0 - reserve)
-            risk_amt = usable*risk_per_trade
+            if book is not None:
+                # حجم از روی اکویتیِ حساب مشترک و وزن سشنِ همان لحظه — عین ربات
+                risk_amt = book.risk_amount(t)
+                book.open_total += 1
+            else:
+                usable = equity*(1.0 - reserve)
+                risk_amt = usable*risk_per_trade
 
             trigger = (p["eff_entry"] + MANAGE_TRIGGER_R * p["risk"]) if direction == "BUY" \
                 else (p["eff_entry"] - MANAGE_TRIGGER_R * p["risk"])
@@ -1311,6 +1456,106 @@ def backtest_one(symbol, h4, d1, w1, years, spread,
         return metrics_df, reasons_df, tdf, zone_df, events_df, z_reason, state
 
     return metrics_df, reasons_df, tdf, zone_df, events_df, z_reason
+
+
+def backtest_one(*args, **kwargs):
+    """اجرای تک‌نمادی (رفتار قبلی، بدون تغییر).
+
+    موتور را تنها اجرا می‌کند و در هر سهمیه‌بندی، سقف خودِ نماد را کامل به آن
+    می‌دهد — یعنی همان «هر چارت تا ۳ سفارش، بدون توجه به بقیه‌ی حساب».
+    """
+    kwargs.pop("alloc_mode", None)
+    max_orders = kwargs.get("max_orders", 3)
+    gen = _backtest_core(*args, alloc_mode=False, **kwargs)
+    reply = None
+    while True:
+        try:
+            gen.send(reply)
+        except StopIteration as stop:
+            return stop.value
+        reply = max_orders
+
+
+def portfolio_live_replay(symbol_frames, spreads, entry_off=None, sl_off=None, rr=None,
+                          manage_mode=None, risk_per_trade=None, reserve=None,
+                          start_equity=None, max_pending_total=None, max_open_total=None,
+                          max_pending_per_symbol=None, basket_order=None,
+                          session_weights=None, **core_kwargs):
+    """بک‌تست «عین لایو»: همه‌ی نمادها هم‌زمان روی یک حساب مشترک.
+
+    هر نماد یک موتور مستقل دارد ولی همه کندل‌به‌کندل با هم جلو می‌روند. سر هر کندل،
+    درست مثل sync_all ربات، سهمیه‌ی سفارش‌ها به‌صورت دوری تقسیم می‌شود:
+    دور اول یک سفارش به هر نماد، بعد دور دوم و سوم — تا وقتی سقف کل حساب پر شود.
+
+    symbol_frames: دیکشنری {نماد: (h4, d1, w1, m15)}
+    """
+    entry_off = DEFAULT_ENTRY_OFF if entry_off is None else entry_off
+    sl_off = DEFAULT_SL_OFF if sl_off is None else sl_off
+    rr = DEFAULT_RR if rr is None else rr
+    manage_mode = DEFAULT_MANAGE if manage_mode is None else manage_mode
+    risk_per_trade = LIVE_RISK_PER_TRADE if risk_per_trade is None else risk_per_trade
+    reserve = LIVE_RESERVE if reserve is None else reserve
+    start_equity = LIVE_START_EQUITY if start_equity is None else start_equity
+    max_pending_total = LIVE_MAX_PENDING_TOTAL if max_pending_total is None else max_pending_total
+    max_open_total = LIVE_MAX_OPEN_TOTAL if max_open_total is None else max_open_total
+    max_per_sym = LIVE_MAX_PENDING_PER_SYMBOL if max_pending_per_symbol is None else max_pending_per_symbol
+    if session_weights is None and USE_DEFAULT_SESSION_WEIGHTS:
+        session_weights = DEFAULT_SESSION_WEIGHTS
+
+    # ترتیب نمادها = ترتیب اولویت در سهمیه‌بندی دوری (عین BASKET ربات)
+    order = [s for s in (basket_order or LIVE_BASKET_ORDER) if s in symbol_frames]
+    order += [s for s in symbol_frames if s not in order]
+
+    book = AccountBook(start_equity=start_equity, reserve=reserve,
+                       risk_per_trade=risk_per_trade, session_weights=session_weights,
+                       max_open_total=max_open_total)
+
+    gens, reqs, results = {}, {}, {}
+    for sym in order:
+        h4, d1, w1, m15 = symbol_frames[sym]
+        gen = _backtest_core(sym, h4, d1, w1, None, spreads.get(sym, 0.0),
+                             entry_off=entry_off, sl_off=sl_off, rr=rr,
+                             reserve=reserve, risk_per_trade=risk_per_trade,
+                             max_orders=max_per_sym, m15=m15, manage_mode=manage_mode,
+                             book=book, alloc_mode=True,
+                             arm_untouched_zones=LIVE_ARM_UNTOUCHED, **core_kwargs)
+        try:
+            reqs[sym] = gen.send(None)
+        except StopIteration as stop:
+            results[sym] = stop.value
+            continue
+        gens[sym] = gen
+
+    # حلقه‌ی زمانیِ مشترک: در هر گام، نمادهایی که روی قدیمی‌ترین کندل ایستاده‌اند
+    # جواب سهمیه می‌گیرند و یک کندل جلو می‌روند.
+    alloc_log = []
+    while gens:
+        t_min = min(r["t"] for r in reqs.values())
+        group = [s for s in order if s in gens and reqs[s]["t"] == t_min]
+
+        # سهمیه‌بندی دوری روی خواسته‌ی همه‌ی نمادهای زنده — عین حلقه‌ی range(3) ربات
+        alloc = {s: 0 for s in gens}
+        total = 0
+        for _round in range(max_per_sym):
+            for s in order:
+                if s not in gens or total >= max_pending_total:
+                    continue
+                if reqs[s]["خواسته"] > alloc[s]:
+                    alloc[s] += 1
+                    total += 1
+
+        alloc_log.append({"زمان": t_min, "سفارش_تخصیص‌یافته": total,
+                          "پوزیشن_باز": book.open_total, "اکویتی": round(book.equity, 2)})
+
+        for s in group:
+            try:
+                reqs[s] = gens[s].send(alloc[s])
+            except StopIteration as stop:
+                results[s] = stop.value
+                gens.pop(s, None)
+                reqs.pop(s, None)
+
+    return results, book, pd.DataFrame(alloc_log)
 
 # ---------------- PDFs ----------------
 def _parse_version_tuple(name: str):
@@ -1741,6 +1986,62 @@ def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_tr
             "yearly": _period_returns("Y").rename(columns={"دوره": "سال"}),
             "monthly": _period_returns("M").rename(columns={"دوره": "ماه"})}
 
+
+def live_book_report(book, trades_df, alloc_df=None):
+    """گزارش حساب در حالت «عین لایو».
+
+    اینجا دیگر هیچ فیلتری روی معاملات اعمال نمی‌شود — سقف‌ها موقع ساخته شدن معامله
+    اعمال شده‌اند، پس این تابع فقط همان حساب واقعی را گزارش می‌کند.
+    """
+    curve_df = pd.DataFrame(book.equity_curve, columns=["زمان", "اکویتی"])
+    rs = trades_df["نتیجه_R"].astype(float) if (trades_df is not None and not trades_df.empty) else pd.Series(dtype=float)
+    wins = int((rs > 0).sum())
+    win_amt = float(rs[rs > 0].sum())
+    loss_amt = float(rs[rs < 0].abs().sum())
+
+    peak_pending = int(alloc_df["سفارش_تخصیص‌یافته"].max()) if (alloc_df is not None and not alloc_df.empty) else 0
+    avg_pending = round(float(alloc_df["سفارش_تخصیص‌یافته"].mean()), 2) if (alloc_df is not None and not alloc_df.empty) else 0.0
+    peak_open = int(alloc_df["پوزیشن_باز"].max()) if (alloc_df is not None and not alloc_df.empty) else 0
+
+    stats = pd.DataFrame([{
+        "حالت": "عین لایو (همه‌ی نمادها هم‌زمان روی یک حساب)",
+        "تعداد_نماد": int(trades_df["نماد"].nunique()) if (trades_df is not None and not trades_df.empty) else 0,
+        "وزن‌دهی_سشن": "فعال" if book.session_weights else "خاموش",
+        "سقف_سفارش_کل_حساب": int(LIVE_MAX_PENDING_TOTAL),
+        "سقف_پوزیشن_کل_حساب": int(book.max_open_total),
+        "سقف_سفارش_هر_نماد": int(LIVE_MAX_PENDING_PER_SYMBOL),
+        "ریسک_هر_معامله٪": round(book.risk_per_trade * 100.0, 2),
+        "معاملات_انجام‌شده": int(len(rs)),
+        "درصد_برد": round(wins / len(rs) * 100.0, 2) if len(rs) else 0.0,
+        "فاکتور_سود": round(win_amt / loss_amt, 3) if loss_amt > 0 else 999.0,
+        "بازده_خالص٪": round((book.equity - book.start_equity) / book.start_equity * 100.0, 2),
+        "حداکثر_افت٪": round(book.max_dd * 100.0, 2),
+        "اکویتی_نهایی": round(book.equity, 2),
+        "بیشترین_سفارش_همزمان": peak_pending,
+        "میانگین_سفارش_همزمان": avg_pending,
+        "بیشترین_پوزیشن_همزمان": peak_open,
+    }])
+
+    def _period_returns(fmt):
+        rows = []
+        prev = book.start_equity
+        if curve_df.empty:
+            return pd.DataFrame(rows)
+        c = curve_df.copy()
+        c["زمان"] = pd.to_datetime(c["زمان"], errors="coerce")
+        c["دوره"] = c["زمان"].dt.to_period(fmt).astype(str)
+        for per, g in c.groupby("دوره"):
+            e = float(g["اکویتی"].iloc[-1])
+            rows.append({"دوره": per, "بازده٪": round((e - prev) / prev * 100.0, 2),
+                         "اکویتی_پایان": round(e, 2)})
+            prev = e
+        return pd.DataFrame(rows)
+
+    return {"stats": stats,
+            "yearly": _period_returns("Y").rename(columns={"دوره": "سال"}),
+            "monthly": _period_returns("M").rename(columns={"دوره": "ماه"})}
+
+
 def main():
     version_name = os.path.basename(os.getcwd())
     outdir = os.path.join(os.getcwd(), "خروجی")
@@ -1800,22 +2101,46 @@ def main():
     sl_mode_rows=[]
     quality_mode_rows=[]
     max_data_time = None
+
+    # --- همه‌ی دیتاها یک‌جا خوانده می‌شود (در حالت «عین لایو» همه با هم لازم‌اند) ---
+    frames = {}
     for zp in zip_files:
-        base=os.path.basename(zp)
-        symbol = base.split(".")[0]  # e.g. USDJPY.W.D.H4.zip => USDJPY
-        h4,d1,w1,m15 = load_timeframes_from_zip(zp)
+        symbol = os.path.basename(zp).split(".")[0]  # e.g. USDJPY.W.D.H4.zip => USDJPY
+        h4, d1, w1, m15 = load_timeframes_from_zip(zp)
         if m15 is None and USE_M15:
             print(f"⚠️ {symbol}: فایل M15 داخل ZIP نیست؛ ابهام‌های داخل کندل بدبینانه (استاپ) حساب می‌شود.")
         if not h4.empty:
             end_t = pd.to_datetime(h4["time"].max(), errors="coerce")
             if pd.notna(end_t):
                 max_data_time = end_t if max_data_time is None else max(max_data_time, end_t)
+        frames[symbol] = (h4, d1, w1, m15)
 
-        mdf, rdf, tdf, zdf, edf, zreason = backtest_one(symbol, h4,d1,w1, years, spreads.get(symbol, 0.0),
-                                                        entry_off=DEFAULT_ENTRY_OFF, sl_off=DEFAULT_SL_OFF,
-                                                        rr=DEFAULT_RR, m15=m15,
-                                                        min_risk_atr=DEFAULT_MIN_RISK_ATR,
-                                                        manage_mode=DEFAULT_MANAGE)
+    live_results = None
+    live_book = None
+    live_alloc = None
+    if LIVE_MODE:
+        print(f"\n🔗 حالت «عین لایو»: {len(frames)} نماد هم‌زمان روی یک حساب | "
+              f"سقف {LIVE_MAX_PENDING_TOTAL} سفارش و {LIVE_MAX_OPEN_TOTAL} پوزیشن در کل حساب، "
+              f"هر نماد حداکثر {LIVE_MAX_PENDING_PER_SYMBOL} سفارش")
+        live_results, live_book, live_alloc = portfolio_live_replay(
+            frames, spreads, entry_off=DEFAULT_ENTRY_OFF, sl_off=DEFAULT_SL_OFF,
+            rr=DEFAULT_RR, manage_mode=DEFAULT_MANAGE, min_risk_atr=DEFAULT_MIN_RISK_ATR)
+        print(f"   اکویتی پایانی: {live_book.equity:,.0f} | "
+              f"بازده {(live_book.equity/live_book.start_equity-1)*100:.2f}٪ | "
+              f"حداکثر افت {live_book.max_dd*100:.2f}٪")
+
+    for symbol, (h4, d1, w1, m15) in frames.items():
+        if LIVE_MODE:
+            res = live_results.get(symbol)
+            if res is None:
+                continue
+            mdf, rdf, tdf, zdf, edf, zreason = res
+        else:
+            mdf, rdf, tdf, zdf, edf, zreason = backtest_one(symbol, h4,d1,w1, years, spreads.get(symbol, 0.0),
+                                                            entry_off=DEFAULT_ENTRY_OFF, sl_off=DEFAULT_SL_OFF,
+                                                            rr=DEFAULT_RR, m15=m15,
+                                                            min_risk_atr=DEFAULT_MIN_RISK_ATR,
+                                                            manage_mode=DEFAULT_MANAGE)
 
         # مقایسه‌ی فیلترهای کیفیت زون (Odds Enhancers)
         if COMPARE_QUALITY_MODES:
@@ -2107,7 +2432,11 @@ def main():
         # --- شبیه‌سازی حساب مشترک (پرتفوی) ---
         port = None
         try:
-            port = portfolio_replay(trades_df, symbols=(PORTFOLIO_SYMBOLS or None))
+            if LIVE_MODE and live_book is not None:
+                # سقف‌ها همان موقع ساخته شدن معامله اعمال شده‌اند — دوباره فیلتر نمی‌کنیم
+                port = live_book_report(live_book, trades_df, live_alloc)
+            else:
+                port = portfolio_replay(trades_df, symbols=(PORTFOLIO_SYMBOLS or None))
         except Exception as e:
             print("⚠️ شبیه‌سازی پرتفوی ناموفق بود:", str(e))
 
