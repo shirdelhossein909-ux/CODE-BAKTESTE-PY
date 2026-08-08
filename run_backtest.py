@@ -1609,10 +1609,14 @@ def _find_baseline_metrics_path(current_dir: str):
         return baseline_new
     return baseline_old if os.path.isfile(baseline_old) else None
 
-def augment_metrics_with_change_review(metrics_df: pd.DataFrame, current_dir: str, years: int):
+def augment_metrics_with_change_review(metrics_df: pd.DataFrame, current_dir: str, years: int,
+                                       book=None):
     """
     به metrics_df ستون‌های مقایسه با نسخه قبلی اضافه می‌کند (اگر پیدا شود).
     همچنین یک ردیف «کل» اضافه می‌کند که KPIهای وزنی را نشان می‌دهد.
+
+    اگر book داده شود (حالت «عین لایو»)، بازده و افتِ ردیف «کل» از خود حساب
+    مشترک خوانده می‌شود — نه میانگین/بیشینه‌ی ستون‌ها که در این حالت گمراه‌کننده است.
     """
     df = metrics_df.copy()
 
@@ -1630,6 +1634,15 @@ def augment_metrics_with_change_review(metrics_df: pd.DataFrame, current_dir: st
         port_monthly = (wealth ** (1.0 / (years * 12.0)) - 1.0) * 100.0
     else:
         win_all = pf_w = r_w = worst_dd = port_return = port_monthly = 0.0
+
+    if book is not None and total_trades > 0:
+        # حالت «عین لایو»: بازده و افت واقعیِ همان یک حساب، نه میانگین ستون‌ها.
+        # (ستون‌های هر نماد در این حالت «سهم آن نماد از بازده حساب» هستند و
+        #  جمعشان بازده کل می‌شود؛ پس میانگین گرفتن از آن‌ها بی‌معنی است.)
+        wealth = book.equity / book.start_equity if book.start_equity else 1.0
+        port_return = (wealth - 1.0) * 100.0
+        worst_dd = book.max_dd * 100.0
+        port_monthly = ((wealth ** (1.0 / (years * 12.0)) - 1.0) * 100.0) if years else 0.0
 
     summary_row = {
         "نماد": "کل",
@@ -2250,7 +2263,8 @@ def main():
         years = 1.0 / 12.0
 
     # --- Review change impact (compares with previous version if available) ---
-    metrics_df, baseline_path = augment_metrics_with_change_review(metrics_df, os.getcwd(), years)
+    metrics_df, baseline_path = augment_metrics_with_change_review(metrics_df, os.getcwd(), years,
+                                                                   book=live_book)
 
     
     # --- خروجی‌ها: فقط دو فایل در پوشه «خروجی» ---
@@ -2505,6 +2519,15 @@ def main():
                     ll_out = pd.concat(ll_rows, ignore_index=True)
             except Exception as e:
                 print("⚠️ مقایسه‌ی محدودیت ضرر ناموفق بود:", str(e))
+
+        if LIVE_MODE and live_book is not None:
+            # در حالت «عین لایو» همه‌ی نمادها روی یک حساب معامله می‌کنند، پس عدد هر
+            # نماد «بازده مستقل» نیست؛ سهم آن نماد از بازده حساب است (جمعشان = بازده کل).
+            # اسم ستون‌ها را صادقانه می‌کنیم تا کسی اشتباه نخواند.
+            summary_out = summary_out.rename(columns={
+                "بازده_خالص٪": "سهم_از_بازده_حساب٪",
+                "حداکثر_افت٪": "افت_سهم_این_نماد٪",
+            })
 
         with pd.ExcelWriter(summary_path, engine="openpyxl") as sw:
             summary_out.to_excel(sw, sheet_name="خلاصه", index=False)
