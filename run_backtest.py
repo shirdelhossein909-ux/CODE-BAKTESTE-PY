@@ -1,0 +1,2747 @@
+# -*- coding: utf-8 -*-
+import os, glob, zipfile, io, json
+import re
+import numpy as np
+
+from analysis_distribution import distribution_sheets
+import pandas as pd
+
+# استفاده از M15 برای رفع ابهام داخل کندل — طبق تصمیم: خاموش.
+# معاملات مبهم (TP و استاپ در یک کندل H4) بدبینانه استاپ حساب می‌شوند
+# و تعداد/اثرشان در ستون‌های «مبهم_...» گزارش می‌شود.
+USE_M15 = False
+
+# بازه‌ی بک‌تست: در صورت نیاز این دو خط را تغییر بده.
+# اگر این تاریخ از شروع دیتا قدیمی‌تر باشد، خودکار روی شروع واقعی دیتا تنظیم می‌شود،
+# پس گذاشتن یک تاریخ قدیمی یعنی «هرچه دیتا داری استفاده کن».
+BACKTEST_START = pd.Timestamp("2019-01-01")  # عملاً = شروع دیتای موجود
+BACKTEST_END = None  # نمونه: pd.Timestamp("2024-12-31")؛ None یعنی تا انتهای دیتا
+
+# هزینه‌های معاملاتی تقریبی (نسبت به اسپرد هر نماد؛ در صورت نیاز این دو عدد را ویرایش کن)
+COMMISSION_SPREAD_MULT = 0.5       # کمیسیون رفت‌وبرگشت ≈ نصف اسپرد
+SWAP_SPREAD_MULT_PER_NIGHT = 0.2   # سواپ ≈ ۲۰٪ اسپرد به ازای هر شب نگهداری پوزیشن
+
+# مقایسه‌ی حالت‌های نقطه‌ی ورود در یک اجرا (شیت «مقایسه_نقطه_ورود» در خلاصه_نتایج.xlsx)
+# اگر نمی‌خواهی و اجرا سریع‌تر شود، این را False کن.
+COMPARE_ENTRY_MODES = False  # مقایسه‌ی نقطه‌ی ورود تمام شد؛ حالت نهایی: -50% وسط زون
+ENTRY_MODES = {
+    "-50% وسط زون": -0.50,
+}
+DEFAULT_ENTRY_OFF = -0.50  # حالت اصلی که گزارش‌های کامل با آن ساخته می‌شود
+
+# مقایسه‌ی نسبت سود به ضرر (RR) — تمام شد؛ RR نهایی: 3
+COMPARE_RR_MODES = False
+RR_MODES = {
+    "RR=3": 3.0,
+}
+DEFAULT_RR = 3.0  # حالت اصلی گزارش‌های کامل
+
+# مقایسه‌ی فیلترهای کیفیت زون (به سبک Odds Enhancers الفونسو) — شیت «مقایسه_کیفیت_زون»
+COMPARE_QUALITY_MODES = False  # نتیجه: بدون فیلتر کیفیت بهترین بود
+QUALITY_MODES = {
+    "مبنا (بدون فیلتر کیفیت)": {},
+    "باطل شدن زون شکسته": {"invalidate_on_breach": True},
+    "حاشیه سود ≥3R": {"min_profit_margin_r": 3.0},
+    "قدرت خروج ≥1×ATR": {"min_departure_atr": 1.0},
+    "فرصت دوباره به زون ردشده": {"retry_rejected_zones": True},
+    "فرصت دوباره + باطل‌شدن شکسته": {"retry_rejected_zones": True, "invalidate_on_breach": True},
+}
+
+# مقایسه‌ی فاصله‌ی حد ضرر از دیستال‌لاین (به نسبت کل ارتفاع زون) — شیت «مقایسه_استاپ»
+COMPARE_SL_MODES = False  # نتیجه: ۲۵٪ برنده شد و پیش‌فرض است
+SL_MODES = {
+    "استاپ 25٪ پشت دیستال": 0.25,
+    "استاپ 50٪ پشت دیستال": 0.50,
+}
+DEFAULT_SL_OFF = 0.25  # حالت اصلی گزارش‌های کامل
+
+# قانون «لغو سفارش در صورت دور شدن قیمت»: اگر قیمت بدون فعال کردن سفارش،
+# به اندازه‌ی چند برابرِ ریسک از نقطه‌ی ورود دور شد، سفارش لغو و زون بی‌اعتبار می‌شود.
+# چند آستانه در یک اجرا مقایسه می‌شود — شیت «مقایسه_لغو_دور»
+COMPARE_DISTCANCEL_MODES = False  # نتیجه: قانون لغو دور شدن برایند را بدتر کرد؛ بدون قانون می‌مانیم
+DISTCANCEL_MODES = {
+    "بدون قانون": 0.0,
+    "دور شدن 3R": 3.0,
+    "دور شدن 4R": 4.0,
+    "دور شدن 5R": 5.0,
+}
+DEFAULT_DIST_CANCEL_R = 0.0  # حالت اصلی گزارش‌های کامل (فعلاً بدون قانون تا مقایسه را ببینیم)
+
+# فیلتر «حداقل اندازه‌ی زون»: اگر فاصله‌ی ورود تا استاپ کمتر از این ضریب از ATR باشد، معامله نمی‌شود.
+# چند آستانه در یک اجرا مقایسه می‌شود — شیت «مقایسه_حداقل_زون»
+COMPARE_MINRISK_MODES = False  # نتیجه: فیلتر کمکی نکرد؛ بدون فیلتر می‌مانیم
+MINRISK_MODES = {
+    "بدون فیلتر": 0.0,
+    "ملایم 0.5xATR": 0.5,
+    "متوسط 0.75xATR": 0.75,
+    "سختگیر 1.0xATR": 1.0,
+}
+DEFAULT_MIN_RISK_ATR = 0.0  # حالت اصلی گزارش‌های کامل (فعلاً بدون فیلتر تا مقایسه را ببینیم)
+
+# --- بک‌تست پرتفویی: شبیه‌سازی یک حساب مشترک برای همه‌ی نمادها (شیت‌های «پرتفوی») ---
+PORTFOLIO_MAX_OPEN = 5              # حداکثر پوزیشن باز هم‌زمان در کل حساب
+PORTFOLIO_RISK_PER_TRADE = 0.005    # ریسک هر معامله از اکویتی حساب (0.005 = نیم درصد، 0.01 = یک درصد)
+PORTFOLIO_SYMBOLS = []              # خالی = همه‌ی نمادها؛ نمونه: ["AUDCAD","EURUSD","CHFJPY","XAUUSD","GBPCAD"]
+
+# ============================================================================
+# حالت «عین لایو» — همه‌ی نمادها هم‌زمان روی یک حساب، دقیقاً مثل sync_all ربات
+# ============================================================================
+# در حالت قدیمی هر نماد جدا بک‌تست می‌شد (سقف ۳ سفارش فقط داخل همان نماد) و سقف
+# کل حساب بعداً در portfolio_replay روی فهرست آماده اعمال می‌شد. نتیجه‌اش این بود
+# که بک‌تست عملاً اجازه‌ی ۱۲×۳ = ۳۶ سفارش هم‌زمان می‌داد ولی ربات فقط ۸ تا.
+# در این حالت، موتور همه‌ی نمادها را کندل‌به‌کندل با هم جلو می‌برد و سهمیه‌بندی
+# دوریِ (round-robin) ربات را عیناً اجرا می‌کند.
+LIVE_MODE = True                    # True = شبیه‌سازی عین لایو (توصیه‌شده)
+LIVE_MAX_PENDING_TOTAL = 8          # سقف سفارش پندینگ کل حساب — برابر MAX_PENDING_TOTAL ربات
+LIVE_MAX_OPEN_TOTAL = 8             # سقف پوزیشن باز کل حساب — برابر MAX_OPEN_TOTAL ربات
+LIVE_MAX_PENDING_PER_SYMBOL = 3     # سقف سفارش هر نماد — برابر حلقه‌ی range(3) ربات
+LIVE_ARM_UNTOUCHED = True           # چیدن سفارش روی زون‌های لمس‌نشده — عین فهرست armed ربات
+LIVE_RISK_PER_TRADE = 0.005         # ریسک هر معامله — برابر RISK_PER_TRADE ربات
+LIVE_RESERVE = 0.15                 # سرمایه‌ی رزرو — برابر RESERVE ربات
+LIVE_START_EQUITY = 100000.0
+# ترتیب نمادها در سهمیه‌بندی دوری — باید عیناً همان ترتیب BASKET در live_trader.py باشد
+# (نماد اول در هر دور اولویت دارد، پس ترتیب روی نتیجه اثر دارد)
+LIVE_BASKET_ORDER = ["XAUUSD", "AUDJPY", "AUDUSD", "CHFJPY", "EURCAD", "EURNZD",
+                     "GBPJPY", "GBPNZD", "NZDCAD", "NZDUSD", "USDCAD", "USDCHF"]
+
+# ============================================================================
+# تست پایداری نمادها — «آیا لبه‌ی این نماد واقعی است یا شانسی؟»
+# ============================================================================
+# تست ۱ (رایگان): بازه به دو نیمه تقسیم می‌شود و کارنامه‌ی هر نماد در هر نیمه
+# جدا گزارش می‌شود. نمادی که فقط در یک نیمه خوب بوده، لبه‌ی واقعی ندارد.
+# خروجی: شیت «پایداری_نماد»
+STABILITY_TEST = True
+STABILITY_MIN_TRADES = 20   # کمتر از این تعداد در یک نیمه = نمونه‌ی کم، قضاوت نکن
+
+# تست ۲ (گران): هر بار یک نماد از سبد برداشته می‌شود و کل بک‌تست دوباره اجرا
+# می‌گردد تا ببینیم حساب بدون آن نماد بهتر می‌شود یا بدتر. چون نمادها سر ۸ جای
+# سفارش با هم رقابت می‌کنند، حذف یک نماد جا را به بقیه می‌دهد — این تنها راهِ
+# درستِ جواب دادن به «حذفش کنم یا نه؟» است.
+# ⚠️ زمان‌بر: (تعداد نمادها + ۱) برابر یک اجرای کامل. برای ۱۲ نماد و دیتای ۶ ساله
+#    حدود ۷۵ دقیقه. فقط وقتی روشنش کن که وقت داری.
+# خروجی: شیت «حذف_تک‌نماد»
+LEAVE_ONE_OUT_TEST = False
+
+# فایل «جزئیات_حرفه‌ای.xlsx» ساخته بشود یا نه (False = فقط خلاصه؛ سریع‌تر)
+WRITE_DETAILS = False
+# شیت‌های ریز پرتفوی (سالانه/ماهانه) هم نوشته شوند؟ False = خروجی تمیزتر
+WRITE_PORTFOLIO_DETAIL = False
+
+# --- تحلیل سشن‌های معاملاتی (شیت‌های «تحلیل_سشن» و «سشن_هر_نماد») ---
+ANALYZE_SESSIONS = False   # تحلیل سشن انجام شد؛ نتیجه‌اش در وزن‌دهی زیر اعمال شده
+SESSION_STABILITY = False
+
+# --- وزن‌دهی ریسک بر اساس سشن (نهایی: حالت تهاجمی، برنده‌ی مقایسه) ---
+USE_DEFAULT_SESSION_WEIGHTS = True
+DEFAULT_SESSION_WEIGHTS = {
+    "لندن": 1.5,
+    "همپوشانی لندن-نیویورک": 1.25,
+    "سیدنی/پایان روز": 1.0,
+    "آسیا (توکیو)": 0.75,
+    "آسیا (پایان)": 0.5,
+    "نیویورک": 0.5,
+}
+
+# مقایسه‌ی «وزن‌دهی ریسک بر اساس سشن» — شیت «مقایسه_وزن_سشن»
+COMPARE_SESSION_WEIGHTS = False
+SESSION_WEIGHT_MODES = {
+    "بدون وزن‌دهی (مبنا)": {},
+    "محافظه‌کارانه": {"آسیا (پایان)": 0.5, "نیویورک": 0.5, "آسیا (توکیو)": 0.75},
+    "تمرکز روی لندن": {"آسیا (پایان)": 0.5, "نیویورک": 0.5, "آسیا (توکیو)": 0.5,
+                        "سیدنی/پایان روز": 0.75},
+    "تهاجمی (لندن ۱.۵ برابر)": {"لندن": 1.5, "همپوشانی لندن-نیویورک": 1.25,
+                                  "آسیا (پایان)": 0.5, "نیویورک": 0.5, "آسیا (توکیو)": 0.75},
+}
+# ساعت دیتای بروکر معمولاً UTC+2 یا UTC+3 است. برای تبدیل به UTC این عدد به ساعت‌ها اضافه می‌شود.
+# اگر مطمئن نیستی صفر بگذار و جدول «ساعت خام» را ببین، بعد کالیبره کن.
+SESSION_HOUR_SHIFT = -3   # نمونه: دیتای UTC+3 → -3 برای رسیدن به UTC
+# بازه‌های سشن بر حسب ساعت UTC — [شروع، پایان)
+SESSION_RANGES = [
+    (0, 4,  "آسیا (توکیو)"),
+    (4, 8,  "آسیا (پایان)"),
+    (8, 12, "لندن"),
+    (12, 16, "همپوشانی لندن-نیویورک"),
+    (16, 20, "نیویورک"),
+    (20, 24, "سیدنی/پایان روز"),
+]
+
+def hour_to_session(h):
+    for a, b, name in SESSION_RANGES:
+        if a <= h < b:
+            return name
+    return "نامشخص"
+
+# مقایسه‌ی «سقف اجرا» (شبیه ربات لایو): هر چارت حداکثر ۱ ترید باز + سقف کل.
+# نتایج در شیت «مقایسه_سقف_اجرا»
+COMPARE_EXECCAP_MODES = False  # نتیجه: «هر چارت ۳ + سقف ۸» انتخاب شد
+EXECCAP_MODES = {
+    "بدون محدودیت": (0, 0),          # (سقف کل تریدهای باز, سقف هر چارت)
+    "هر چارت 1 + سقف 3": (3, 1),
+    "هر چارت 1 + سقف 5": (5, 1),
+}
+
+# مقایسه‌ی «مدیریت معامله» (سیو سود / ریسک‌فری وقتی سود به ۲ برابر ریسک رسید)
+# نتایج در شیت «مقایسه_مدیریت»
+COMPARE_MANAGE_MODES = False  # نتیجه: «سیو سود در 2R» برنده شد و پیش‌فرض است؛ ریسک‌فری حذف قطعی
+MANAGE_MODES = {
+    "عادی (بدون مدیریت)": "none",
+    "سیو سود در 2R": "partial2",
+    "سیو سود + ریسک‌فری در 2R": "partial2_be",
+    "ریسک‌فری در 2R": "be2",
+}
+DEFAULT_MANAGE = "partial2"  # حالت اصلی: سیو سودِ نصف حجم در 2R (برنده‌ی مقایسه)
+MANAGE_TRIGGER_R = 2.0      # آستانه‌ی فعال شدن مدیریت: سود ۲ برابر ریسک
+PARTIAL_CLOSE_FRAC = 0.5    # سهم سیو سود: نصف حجم
+
+# مقایسه‌ی «محدودیت ضرر» — نتیجه: کمکی نکرد (فقط سود کمتر)؛ بدون محدودیت می‌مانیم
+COMPARE_LOSSLIMIT_MODES = False
+LOSSLIMIT_MODES = {
+    "بدون محدودیت": (0, 0),
+    "3 ضرر روز / 7 هفته": (3, 7),
+    "2 ضرر روز / 5 هفته": (2, 5),
+    "3 ضرر روز / 5 هفته": (3, 5),
+}
+
+# ------------- CSV reader (MetaTrader no header) -------------
+def _smart_dt(d, t=None):
+    """تبدیل تاریخ به datetime با تشخیص خودکار ترتیب روز/ماه (برای فرمت‌های مختلف بروکرها)."""
+    s = d.astype(str).str.strip()
+    if t is not None:
+        s = s + " " + t.astype(str).str.strip()
+    samp = s.head(500).str.extract(r"^(\d{1,4})[./-](\d{1,2})[./-](\d{1,4})")
+    dayfirst = False
+    try:
+        first = pd.to_numeric(samp[0], errors="coerce")
+        if first.notna().any() and first.max() <= 31 and (first > 12).any():
+            dayfirst = True
+    except Exception:
+        pass
+    return pd.to_datetime(s, errors="coerce", dayfirst=dayfirst)
+
+
+def read_mt_csv_from_bytes(b: bytes) -> pd.DataFrame:
+    """خواندن CSV قیمت با تشخیص خودکار فرمت:
+    - متاتریدر بدون سطر عنوان (date,time,o,h,l,c[,v])
+    - فایل‌های دارای سطر عنوان (مثل FXCM): ستون‌های Open/High/Low/Close یا BidOpen/BidHigh/...
+      و تاریخ به‌صورت دو ستون Date/Time یا یک ستون DateTime"""
+    if b is None or len(b) == 0:
+        raise ValueError("فایل CSV خالی است.")
+
+    head = b[:2048].decode("utf-8", "ignore")
+    first_line = head.splitlines()[0].lower() if head else ""
+    has_header = any(k in first_line for k in ("open", "high", "low", "close"))
+
+    if has_header:
+        df = pd.read_csv(io.BytesIO(b))
+        df.columns = [str(c).strip().lower().replace(" ", "") for c in df.columns]
+
+        def pick(*names):
+            for nm in names:
+                if nm in df.columns:
+                    return df[nm]
+            return None
+
+        o = pick("open", "bidopen"); h = pick("high", "bidhigh")
+        l = pick("low", "bidlow");   c = pick("close", "bidclose")
+        if o is None or h is None or l is None or c is None:
+            raise ValueError("ستون‌های قیمت (Open/High/Low/Close یا BidOpen/...) پیدا نشد.")
+
+        dcol = pick("date"); tcol = pick("time", "datetime", "timestamp", "gmttime")
+        if dcol is not None and tcol is not None:
+            tser = _smart_dt(dcol, tcol)
+        elif dcol is not None:
+            tser = _smart_dt(dcol)
+        elif tcol is not None:
+            tser = _smart_dt(tcol)
+        else:
+            tser = _smart_dt(df.iloc[:, 0])
+    else:
+        df = pd.read_csv(io.BytesIO(b), header=None)
+        if df.shape[1] < 5:
+            raise ValueError("فرمت CSV غیرمنتظره است (ستون کم).")
+        c1 = pd.to_numeric(df.iloc[:, 1], errors="coerce")
+        if c1.notna().mean() > 0.9:
+            # ستون اول تاریخ+ساعت یکجا است
+            tser = _smart_dt(df.iloc[:, 0])
+            o, h, l, c = (df.iloc[:, k] for k in (1, 2, 3, 4))
+        else:
+            # فرمت کلاسیک متاتریدر: date,time,o,h,l,c
+            if df.shape[1] < 6:
+                raise ValueError("فرمت CSV غیرمنتظره است (ستون کم).")
+            tser = _smart_dt(df.iloc[:, 0], df.iloc[:, 1])
+            o, h, l, c = (df.iloc[:, k] for k in (2, 3, 4, 5))
+
+    out = pd.DataFrame({
+        "time": tser,
+        "open": pd.to_numeric(o, errors="coerce"),
+        "high": pd.to_numeric(h, errors="coerce"),
+        "low":  pd.to_numeric(l, errors="coerce"),
+        "close": pd.to_numeric(c, errors="coerce"),
+    })
+    out = out.dropna().sort_values("time").drop_duplicates("time").reset_index(drop=True)
+    if out.empty:
+        raise ValueError("هیچ سطر معتبری در CSV پیدا نشد (فرمت ناشناخته).")
+    return out
+
+def load_timeframes_from_zip(zip_path: str):
+    if not os.path.exists(zip_path):
+        raise FileNotFoundError(f"فایل ZIP پیدا نشد: {zip_path}")
+
+    with zipfile.ZipFile(zip_path, "r") as z:
+        names = z.namelist()
+        if not names:
+            raise ValueError(f"فایل ZIP خالی است: {zip_path}")
+
+        f240_list = [n for n in names if n.endswith("-240.csv")]
+        f1d_list  = [n for n in names if n.endswith("-1D.csv")]
+        f1w_list  = [n for n in names if n.endswith("-1W.csv")]
+        f15_list  = [n for n in names if n.endswith("-15.csv") or n.endswith("-M15.csv")]  # اختیاری
+
+        if not f240_list or not f1d_list or not f1w_list:
+            raise ValueError(
+                f"داخل ZIP فایل‌های لازم پیدا نشد: {zip_path} | "
+                f"240={len(f240_list)} 1D={len(f1d_list)} 1W={len(f1w_list)}"
+            )
+
+        f240 = f240_list[0]
+        f1d = f1d_list[0]
+        f1w = f1w_list[0]
+
+        h4 = read_mt_csv_from_bytes(z.read(f240))
+        d1 = read_mt_csv_from_bytes(z.read(f1d))
+        w1 = read_mt_csv_from_bytes(z.read(f1w))
+        m15 = read_mt_csv_from_bytes(z.read(f15_list[0])) if f15_list else None
+
+    if h4.empty or d1.empty or w1.empty:
+        raise ValueError(
+            f"داده‌ی یکی از تایم‌فریم‌ها داخل ZIP خالی است: {zip_path} | "
+            f"h4={len(h4)} d1={len(d1)} w1={len(w1)}"
+        )
+
+    return h4, d1, w1, m15
+
+# ---------------- Indicators ----------------
+def atr(df: pd.DataFrame, period=14):
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        (df["high"] - df["low"]),
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(period, min_periods=period).mean()
+
+def range_filter(df: pd.DataFrame, atr_s: pd.Series, lookback=20, k=3.0):
+    hh = df["high"].rolling(lookback, min_periods=lookback).max()
+    ll = df["low"].rolling(lookback, min_periods=lookback).min()
+    return (hh - ll) < (k * atr_s)
+
+
+
+def swing_points(df: pd.DataFrame, n=1):
+    highs = df["high"].values
+    lows  = df["low"].values
+    sh = np.zeros(len(df), dtype=bool)
+    sl = np.zeros(len(df), dtype=bool)
+    for i in range(n, len(df)-n):
+        if np.all(highs[i] > highs[i-n:i]) and np.all(highs[i] > highs[i+1:i+n+1]):
+            sh[i] = True
+        if np.all(lows[i] < lows[i-n:i]) and np.all(lows[i] < lows[i+1:i+n+1]):
+            sl[i] = True
+    return sh, sl
+
+def trend_from_swings(df: pd.DataFrame, n=1):
+    """
+    نسخه بدون lookahead:
+    swing_points همچنان با همان منطقِ قبلی سوئینگ‌ها را تعیین می‌کند،
+    اما سیگنال سوئینگ فقط بعد از n کندل (یعنی وقتی قابل تایید است) وارد trend می‌شود.
+    """
+    sh, sl = swing_points(df, n=n)
+
+    last_hi = np.nan
+    last_lo = np.nan
+    cur = 0
+    out = np.zeros(len(df), dtype=int)
+
+    for i in range(len(df)):
+        # تأیید سوئینگ با تأخیر n کندل
+        j = i - n
+        if j >= 0:
+            if sh[j]:
+                last_hi = df["high"].iloc[j]
+            if sl[j]:
+                last_lo = df["low"].iloc[j]
+
+        c = df["close"].iloc[i]
+        if (not np.isnan(last_hi)) and c > last_hi:
+            cur = 1
+        elif (not np.isnan(last_lo)) and c < last_lo:
+            cur = -1
+
+        out[i] = cur
+
+    return pd.Series(out, index=df.index)
+# ---------------- Base/Doji rules ----------------
+def is_base_candle(row):
+    rng = row["high"] - row["low"]
+    if rng <= 0: return False
+    body = abs(row["close"] - row["open"])
+    return body <= 0.5 * rng
+
+def is_doji_small(row, atr_v, body_ratio_max=0.20, range_atr_max=0.80):
+    rng = row["high"] - row["low"]
+    if rng <= 0 or atr_v is None or np.isnan(atr_v) or atr_v <= 0:
+        return False
+    body = abs(row["close"] - row["open"])
+    return (body / rng) <= body_ratio_max and (rng <= (range_atr_max * atr_v))
+
+def strong_close(row):
+    rng = row["high"] - row["low"]
+    if rng <= 0: return False
+    body = abs(row["close"] - row["open"])
+    return body > 0.5 * rng
+
+# ---------------- Zone structure ----------------
+class Zone:
+    def __init__(self, symbol, tf, direction, proximal, distal, created_time, base_start, base_end, doji_shadow):
+        self.symbol=symbol
+        self.tf=tf
+        self.direction=direction
+        self.proximal=float(proximal)
+        self.distal=float(distal)
+        self.created_time=created_time
+        self.base_start=base_start
+        self.base_end=base_end
+        self.doji_shadow=bool(doji_shadow)
+        self.touch_count=0
+        self.last_touch_i=None
+        self.clean_after_touch=999
+        self.expired=False
+        self.zone_id=None
+        self.superseded_time=None  # زمانی که زون جدیدِ هم‌پوشان جای این زون را می‌گیرد
+        self.conf_body_atr=0.0     # قدرت خروج: بدنه‌ی کندل تأیید نسبت به ATR
+        self.departure_h=0.0       # حاشیه‌ی سود: بیشترین حرکت از زون (برحسب ارتفاع زون) پیش از بازگشت
+
+    def low(self): return min(self.proximal, self.distal)
+    def high(self): return max(self.proximal, self.distal)
+
+def build_zones(df, symbol, tf, max_base_len, atr_s):
+    zones=[]
+    i=0
+    while i < len(df)-3:
+        made=None
+        for L in range(1, max_base_len+1):
+            if i+L >= len(df): break
+            base=df.iloc[i:i+L]
+            if not base.apply(is_base_candle, axis=1).all():
+                break
+
+            base_high=base["high"].max()
+            base_low =base["low"].min()
+
+            conf=df.iloc[i+L]
+            if not strong_close(conf):
+                continue
+
+            bull = conf["close"] > base_high
+            bear = conf["close"] < base_low
+            if not (bull or bear):
+                continue
+
+            # ATR هر کندل بیس با موقعیت (نه برچسب ایندکس) خوانده می‌شود تا وابسته به ایندکس نباشد
+            atr_vals = atr_s.iloc[i:i+L].tolist()
+            doji_flags=[is_doji_small(r, atr_vals[k]) for k, (_, r) in enumerate(base.iterrows())]
+            doji_shadow = bool(all(doji_flags))
+
+            if bull:
+                direction="BUY"
+                if doji_shadow:
+                    proximal=base_high
+                    distal=base_low
+                else:
+                    proximal=float(max(base[["open","close"]].max(axis=1)))
+                    distal=float(base_low)
+            else:
+                direction="SELL"
+                if doji_shadow:
+                    proximal=base_low
+                    distal=base_high
+                else:
+                    proximal=float(min(base[["open","close"]].min(axis=1)))
+                    distal=float(base_high)
+
+            z=Zone(symbol, tf, direction, proximal, distal,
+                   df["time"].iloc[i+L], df["time"].iloc[i], df["time"].iloc[i+L-1], doji_shadow)
+
+            # --- معیارهای کیفیت زون (به سبک Odds Enhancers) ---
+            height = z.high() - z.low()
+            # ۱) قدرت خروج: بدنه‌ی کندل تأیید نسبت به ATR همان کندل
+            atr_conf = atr_s.iloc[i+L] if (i+L) < len(atr_s) else np.nan
+            conf_body = abs(float(conf["close"]) - float(conf["open"]))
+            z.conf_body_atr = float(conf_body / atr_conf) if (not pd.isna(atr_conf) and atr_conf > 0) else 0.0
+
+            # ۲) حاشیه‌ی سود: قیمت پیش از بازگشت به زون، چند برابر ارتفاع زون حرکت کرده؟
+            #    (کاملاً گذشته‌نگر است: تا وقتی قیمت برنگردد، معامله‌ای هم رخ نمی‌دهد)
+            if height > 0:
+                best = 0.0
+                for k in range(i+L, min(i+L+200, len(df))):
+                    hi_k = float(df["high"].iloc[k]); lo_k = float(df["low"].iloc[k])
+                    if direction == "BUY":
+                        best = max(best, (hi_k - z.high()) / height)
+                        if lo_k <= z.high():      # قیمت به زون برگشت → پایان اندازه‌گیری
+                            if k > i+L:
+                                break
+                    else:
+                        best = max(best, (z.low() - lo_k) / height)
+                        if hi_k >= z.low():
+                            if k > i+L:
+                                break
+                z.departure_h = float(max(0.0, best))
+
+            made=(L, z)
+            break
+
+        if made:
+            zones.append(made[1])
+            i += made[0] + 1
+        else:
+            i += 1
+    return zones
+
+def overlap_ratio(a_low,a_high,b_low,b_high):
+    inter=max(0.0, min(a_high,b_high)-max(a_low,b_low))
+    uni=max(a_high,b_high)-min(a_low,b_low)
+    return inter/uni if uni>0 else 0.0
+
+def dedup_zones_pit(zones, thr=0.55):
+    """حذف زون‌های هم‌پوشان بدون نگاه به آینده:
+    هر زون جدید، زون‌های هم‌پوشانِ قبلی را فقط از «زمان ایجاد خودش» به بعد جایگزین می‌کند
+    و محدوده‌اش با زون‌های قبلی (که در آن لحظه معلوم‌اند) تنگ‌تر می‌شود."""
+    zones = sorted(zones, key=lambda z: z.created_time)
+    active = []
+    for z in zones:
+        for old in active:
+            if overlap_ratio(z.low(), z.high(), old.low(), old.high()) >= thr:
+                old.superseded_time = z.created_time
+                low = max(z.low(), old.low()); high = min(z.high(), old.high())
+                if low < high:
+                    if z.direction == "BUY":
+                        z.proximal = high; z.distal = low
+                    else:
+                        z.proximal = low; z.distal = high
+        active = [a for a in active if a.superseded_time is None]
+        active.append(z)
+    return zones
+
+def body_overlaps_zone(o,c,z:Zone):
+    bl=min(o,c); bh=max(o,c)
+    return (bh >= z.low()) and (bl <= z.high())
+
+# ---------------- Reporting helpers ----------------
+def init_zone_table(h_z):
+    rows=[]
+    for z in h_z:
+        rows.append({
+            "ZoneID": z.zone_id,
+            "نماد": z.symbol,
+            "تایم‌فریم": z.tf,
+            "جهت": "خرید" if z.direction=="BUY" else "فروش",
+            "تاریخ_ایجاد": z.created_time,
+            "پراکسیمال": z.proximal,
+            "دیستال": z.distal,
+            "بیس_شروع": z.base_start,
+            "بیس_پایان": z.base_end,
+            "دوجی_شدو": z.doji_shadow,
+            "Touch1": None,
+            "Touch2": None,
+            "تعداد_تست": 0,
+            "FinalStatus": "",
+            "FinalReason": "",
+            "FinalTime": None,
+            "زمان_ثبت_سفارش": None,
+            "زمان_پرشدن": None,
+            "زمان_خروج": None,
+            "نتیجه_R": None
+        })
+    return pd.DataFrame(rows)
+
+def set_final(zone_df, zid, status, reason, t):
+    mask = zone_df["ZoneID"]==zid
+    if not mask.any(): return
+    if str(zone_df.loc[mask, "FinalStatus"].iloc[0]).strip() != "":
+        return
+    zone_df.loc[mask, "FinalStatus"] = status
+    zone_df.loc[mask, "FinalReason"] = reason
+    zone_df.loc[mask, "FinalTime"] = t
+
+def log_event(events, t, symbol, zid, etype, detail=""):
+    events.append({
+        "زمان": t,
+        "نماد": symbol,
+        "ZoneID": zid,
+        "نوع_رویداد": etype,
+        "جزئیات": detail
+    })
+
+# ---------------- Backtest (logic unchanged; reporting upgraded) ----------------
+class AccountBook:
+    """حساب مشترک همه‌ی نمادها در حالت «عین لایو».
+
+    اکویتی، تعداد پوزیشن باز کل حساب و افت سرمایه اینجا نگه داشته می‌شود تا همه‌ی
+    نمادها روی یک حساب واقعی معامله کنند — نه هرکدام روی حساب فرضی خودش.
+    """
+
+    def __init__(self, start_equity=100000.0, reserve=0.15, risk_per_trade=0.005,
+                 session_weights=None, max_open_total=8):
+        self.equity = float(start_equity)
+        self.start_equity = float(start_equity)
+        self.peak = float(start_equity)
+        self.max_dd = 0.0
+        self.reserve = float(reserve)
+        self.risk_per_trade = float(risk_per_trade)
+        self.session_weights = session_weights or {}
+        self.max_open_total = int(max_open_total)
+        self.open_total = 0
+        self.equity_curve = []   # (زمان، اکویتی) بعد از هر معامله‌ی بسته‌شده
+
+    def session_weight(self, t):
+        if not self.session_weights:
+            return 1.0
+        try:
+            hr = (pd.Timestamp(t).hour + SESSION_HOUR_SHIFT) % 24
+        except Exception:
+            return 1.0
+        return float(self.session_weights.get(hour_to_session(hr), 1.0))
+
+    def risk_amount(self, t):
+        return self.equity * (1.0 - self.reserve) * self.risk_per_trade * self.session_weight(t)
+
+    def apply_result(self, t, risk_amt, result_r):
+        self.equity += float(risk_amt) * float(result_r)
+        self.peak = max(self.peak, self.equity)
+        if self.peak > 0:
+            self.max_dd = max(self.max_dd, (self.peak - self.equity) / self.peak)
+        self.equity_curve.append((t, self.equity))
+
+
+def _backtest_core(symbol, h4, d1, w1, years, spread,
+                   entry_off=0.10, sl_off=0.25, rr=3.0,
+                   reserve=0.15, risk_per_trade=0.01, max_orders=3,
+                   m15=None, min_risk_atr=0.0, dist_cancel_r=0.0, manage_mode="none",
+                   max_open_per_symbol=0,
+                   invalidate_on_breach=False, min_profit_margin_r=0.0, min_departure_atr=0.0,
+                   retry_rejected_zones=False, return_state=False,
+                   book=None, alloc_mode=False, arm_untouched_zones=False):
+    """موتور استراتژی برای یک نماد — به‌صورت generator.
+
+    در هر کندل، درست سر جایی که ربات لایو تصمیم می‌گیرد کدام سفارش‌ها روی حساب
+    بمانند، این تابع «فهرست خواسته‌هایش» را yield می‌کند و منتظر می‌ماند تا راننده
+    (portfolio_live_replay) بگوید چند سهمیه گرفته است. اگر alloc_mode خاموش باشد
+    هیچ‌وقت yield نمی‌کند و رفتارش دقیقاً مثل قبل است.
+    """
+
+    bt_start = BACKTEST_START
+
+    h4 = h4.copy(); d1 = d1.copy(); w1 = w1.copy()
+    for df in (h4, d1, w1):
+        df["open"]=df["open"].astype(float)
+        df["high"]=df["high"].astype(float)
+        df["low"]=df["low"].astype(float)
+        df["close"]=df["close"].astype(float)
+
+    # ATR warmup روی کل دیتا
+    h4["atr"] = atr(h4)
+    d1["atr"] = atr(d1)
+    w1["atr"] = atr(w1)
+
+    # برش انتهای بازه‌ی بک‌تست (اگر BACKTEST_END تنظیم شده باشد)
+    if BACKTEST_END is not None:
+        h4 = h4[h4["time"] <= BACKTEST_END].copy()
+        d1 = d1[d1["time"] <= BACKTEST_END].copy()
+        w1 = w1[w1["time"] <= BACKTEST_END].copy()
+        if m15 is not None:
+            m15 = m15[m15["time"] <= BACKTEST_END].copy()
+
+    # کات اولیه از 2023 به بعد (برای منطق، نه ATR)
+    h4_ = h4[h4["time"] >= bt_start].copy()
+    d1_ = d1[d1["time"] >= bt_start].copy()
+    w1_ = w1[w1["time"] >= bt_start].copy()
+
+    if h4_.empty or d1_.empty or w1_.empty:
+        metrics_df = pd.DataFrame([{
+            "نماد":symbol,"تعداد":0,"درصد_برد":0.0,"فاکتور_سود":0.0,
+            "بازده_خالص٪":0.0,"حداکثر_افت٪":0.0,"میانگین_R":0.0
+        }])
+        reasons_df = pd.DataFrame([{"نماد":symbol,"دلیل":"دیتا ناکافی بعد از 2023", "تعداد":1}])
+        return metrics_df, reasons_df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    # شروع واقعی بک‌تست = جایی که هر سه تایم‌فریم بعد از 2023 دیتا دارند
+    global_start = max(bt_start, h4_["time"].min(), d1_["time"].min(), w1_["time"].min())
+
+    h4 = h4[h4["time"] >= global_start].reset_index(drop=True)
+    d1 = d1[d1["time"] >= global_start].reset_index(drop=True)
+    w1 = w1[w1["time"] >= global_start].reset_index(drop=True)
+
+    if h4.empty or d1.empty or w1.empty:
+        metrics_df = pd.DataFrame([{
+            "نماد":symbol,"تعداد":0,"درصد_برد":0.0,"فاکتور_سود":0.0,
+            "بازده_خالص٪":0.0,"حداکثر_افت٪":0.0,"میانگین_R":0.0
+        }])
+        reasons_df = pd.DataFrame([{"نماد":symbol,"دلیل":"دیتا ناکافی بعد از sync", "تعداد":1}])
+        return metrics_df, reasons_df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    # range/trend روی دیتای کات‌شده
+    h4["range"] = range_filter(h4, h4["atr"])
+    d1["range"] = range_filter(d1, d1["atr"])
+    h4["trend"] = trend_from_swings(h4, n=1)  # همین حالا بدون lookahead شده چون trend_from_swings را عوض کردی
+    d1["trend"] = trend_from_swings(d1, n=1)
+
+    w_z = dedup_zones_pit(build_zones(w1, symbol, "W1", 12, w1["atr"]))
+    h_z = dedup_zones_pit(build_zones(h4, symbol, "H4", 6,  h4["atr"]))
+
+    # ZoneID
+    h_z = sorted(h_z, key=lambda z: z.created_time)
+    for idx, z in enumerate(h_z, start=1):
+        z.zone_id = f"{symbol}_H4_{idx:05d}"
+
+    zone_df = init_zone_table(h_z)
+    events = []
+
+    d_times = d1["time"].values
+    def last_idx_leq(times, t):
+        return np.searchsorted(times, t, side="right") - 1
+
+    equity=100000.0; peak=equity; max_dd=0.0
+    pending=[]    # سفارش در انتظار
+    open_pos=[]   # پوزیشن باز
+    trades=[]
+
+    reasons={
+        "زون_چهارساعته_کل": len(h_z),
+        "رد_به_خاطر_رنج": 0,
+        "رد_به_خاطر_روند": 0,
+        "رد_به_خاطر_زون_کوچک": 0,
+        "رد_به_خاطر_سقف_سفارش": 0,
+        "رد_به_خاطر_سقف_پوزیشن_نماد": 0,
+        "لغو_به_خاطر_سهمیه_کل_حساب": 0,
+        "رد_به_خاطر_سقف_پوزیشن_کل_حساب": 0,
+        "لغو_به_خاطر_هفتگی": 0,
+        "لغو_به_خاطر_دور_شدن": 0,
+        "لغو_به_خاطر_تست_سوم": 0,
+        "لغو_سفارشِ_زون_باطل": 0,
+        "باطل_شدن_زون_شکسته": 0,
+        "رد_به_خاطر_حاشیه_سود_کم": 0,
+        "رد_به_خاطر_خروج_ضعیف": 0,
+        "لغو_به_خاطر_رنج_یا_روند_لحظه_ورود": 0,
+        "انقضا_زون": 0,
+        "جایگزینی_زون": 0,
+        "ورود_انجام_شد": 0,
+        "خروج_همزمان_حل_با_M15": 0,
+        "خروج_همزمان_بدون_M15_استاپ_فرض": 0,
+        "کندل_ورود_حل_با_M15": 0,
+        "TP_کندل_ورود_بدون_M15": 0,
+    }
+
+    # --- آماده‌سازی M15 برای رفع ابهام داخل کندل H4 ---
+    m15_t = m15_h = m15_l = None
+    if USE_M15 and m15 is not None and not m15.empty:
+        m15_t = m15["time"].values
+        m15_h = m15["high"].astype(float).values
+        m15_l = m15["low"].astype(float).values
+
+    H4_SPAN = np.timedelta64(4, "h")
+
+    def _m15_range(t_bar):
+        if m15_t is None:
+            return None
+        t0 = t_bar.to_datetime64()
+        i0 = int(np.searchsorted(m15_t, t0, side="left"))
+        i1 = int(np.searchsorted(m15_t, t0 + H4_SPAN, side="left"))
+        if i1 <= i0:
+            return None
+        return i0, i1
+
+    def resolve_both_hit_m15(direction, sl, tp, t_bar):
+        """وقتی در یک کندل H4 هم استاپ و هم حدسود لمس شده،
+        با M15 مشخص می‌کند کدام اول بوده. اگر هر دو در یک کندل M15 بود: بدبینانه استاپ."""
+        rng = _m15_range(t_bar)
+        if rng is None:
+            return None
+        for j in range(rng[0], rng[1]):
+            hi = m15_h[j]; lo = m15_l[j]
+            if direction == "BUY":
+                if lo <= sl: return "sl"
+                if hi >= tp: return "tp"
+            else:
+                if hi >= sl: return "sl"
+                if lo <= tp: return "tp"
+        return None
+
+    def resolve_entry_candle_m15(direction, entry, sl, tp, t_bar):
+        """در کندل ورود: اول لحظه‌ی پر شدن سفارش را در M15 پیدا می‌کند،
+        بعد فقط اتفاقات بعد از آن را می‌شمارد (سقف/کف قبل از ورود حساب نمی‌شود).
+        در خودِ کندلِ پر شدن فقط استاپ پذیرفته می‌شود (بدبینانه).
+        خروجی: sl / tp / open / nofill / None(=M15 نیست)"""
+        rng = _m15_range(t_bar)
+        if rng is None:
+            return None
+        filled = False
+        for j in range(rng[0], rng[1]):
+            hi = m15_h[j]; lo = m15_l[j]
+            if not filled:
+                if direction == "BUY" and lo <= entry:
+                    filled = True
+                    if lo <= sl:
+                        return "sl"
+                elif direction == "SELL" and hi >= entry:
+                    filled = True
+                    if hi >= sl:
+                        return "sl"
+                continue
+            if direction == "BUY":
+                if lo <= sl: return "sl"
+                if hi >= tp: return "tp"
+            else:
+                if hi >= sl: return "sl"
+                if lo <= tp: return "tp"
+        return "open" if filled else "nofill"
+
+    # هزینه‌های تقریبی این نماد (برحسب قیمت)
+    commission_cost = COMMISSION_SPREAD_MULT * float(spread)
+    swap_per_night = SWAP_SPREAD_MULT_PER_NIGHT * float(spread)
+
+    def make_order(z:Zone, t_now, test_no):
+        height = z.high()-z.low()
+        if height<=0: height=1e-9
+        # ورود = پراکسیمال + entry_off × ارتفاع بیس، به سمت قیمت.
+        # entry_off مثبت = بیرون زون نزدیک قیمت (جبران اسپرد)، منفی = داخل زون دورتر از قیمت.
+        # اسپرد جداگانه دوباره حساب نمی‌شود.
+        if z.direction=="BUY":
+            entry = z.proximal + entry_off*height
+            sl    = z.distal  - sl_off*height
+            eff_entry = entry
+            risk = eff_entry - sl
+            tp = eff_entry + rr*risk
+        else:
+            entry = z.proximal - entry_off*height
+            sl    = z.distal  + sl_off*height
+            eff_entry = entry
+            risk = sl - eff_entry
+            tp = eff_entry - rr*risk
+
+        zone_df.loc[zone_df["ZoneID"]==z.zone_id, "زمان_ثبت_سفارش"] = t_now
+
+        return {"z":z,"entry":float(entry),"sl":float(sl),"tp":float(tp),
+                "eff_entry":float(eff_entry),"t":t_now,"test":test_no,
+                "active":True,"filled":False,"fill_time":None,"cancel":None,
+                "risk": float(risk)}
+
+    def finalize_trade(pos, exit_time, exit_price, reason):
+        nonlocal equity, peak, max_dd
+        direction = pos["direction"]
+        eff_entry = pos["eff_entry"]
+        risk = pos["risk"]
+        if risk <= 0:
+            return
+
+        raw_r = (exit_price - eff_entry)/risk if direction=="BUY" else (eff_entry - exit_price)/risk
+        # سهم سیوسودشده (banked) + سهم باقی‌مانده (frac) — در حالت عادی: 0 و 1
+        result_r = pos.get("banked", 0.0) + pos.get("frac", 1.0) * float(raw_r)
+
+        # کسر هزینه‌های تقریبی: کمیسیون + سواپ به ازای هر شب نگهداری
+        try:
+            nights = max(0, int((pd.Timestamp(exit_time).normalize() - pd.Timestamp(pos["fill_time"]).normalize()).days))
+        except Exception:
+            nights = 0
+        result_r = float(result_r) - (commission_cost + swap_per_night * nights) / risk
+
+        if book is not None:
+            # حساب مشترک: اکویتی و افت سرمایه در سطح کل حساب به‌روز می‌شود
+            book.apply_result(exit_time, pos["risk_amt"], result_r)
+            book.open_total = max(0, book.open_total - 1)
+        equity += pos["risk_amt"] * float(result_r)
+        peak=max(peak,equity)
+        dd=(peak-equity)/peak if peak>0 else 0.0
+        max_dd=max(max_dd,dd)
+
+        z = pos["z"]
+        trades.append({
+            "نماد":symbol,"جهت":("خرید" if direction=="BUY" else "فروش"),
+            "زمان_ورود":pos["fill_time"],"ورود":eff_entry,"حدضرر":pos["sl"],"حدسود":pos["tp"],
+            "زمان_خروج":exit_time,"قیمت_خروج":float(exit_price),"نتیجه_R":float(result_r),
+            "برد": (result_r>0), "علت_خروج":reason, "تست":pos["test"],
+            "ZoneID": pos["ZoneID"],
+            "پراکسیمال":z.proximal,"دیستال":z.distal,
+            "بیس_شروع":z.base_start,"بیس_پایان":z.base_end,
+            "دوجی_شدو":z.doji_shadow
+        })
+
+        zone_df.loc[zone_df["ZoneID"]==pos["ZoneID"], ["زمان_خروج","نتیجه_R"]] = [exit_time, float(result_r)]
+        final = "پر شد: برد" if result_r>0 else "پر شد: باخت"
+        set_final(zone_df, pos["ZoneID"], final, reason, exit_time)
+        log_event(events, exit_time, symbol, pos["ZoneID"], "Exit", final)
+
+    def process_pos_candle(pos, h, l, t):
+        """خروج/مدیریت یک پوزیشن در یک کندل H4 — همیشه بدبینانه (اول استاپ).
+        مدیریت (سیو سود/ریسک‌فری) وقتی سود به MANAGE_TRIGGER_R برابر ریسک برسد فعال می‌شود."""
+        direction = pos["direction"]
+        sl = pos["sl"]; tp = pos["tp"]
+        if direction == "BUY":
+            hit_sl = l <= sl; hit_tp = h >= tp
+        else:
+            hit_sl = h >= sl; hit_tp = l <= tp
+
+        # فعال‌سازی مدیریت — فقط اگر در همین کندل استاپ لمس نشده باشد (بدبینانه)
+        if manage_mode != "none" and not pos.get("managed") and not hit_sl:
+            trg = pos["trigger"]
+            hit_trg = (h >= trg) if direction == "BUY" else (l <= trg)
+            if hit_trg:
+                pos["managed"] = True
+                if manage_mode in ("partial2", "partial2_be"):
+                    # نصف حجم در 2R نقد می‌شود
+                    pos["banked"] = MANAGE_TRIGGER_R * PARTIAL_CLOSE_FRAC
+                    pos["frac"] = 1.0 - PARTIAL_CLOSE_FRAC
+                if manage_mode in ("partial2_be", "be2"):
+                    # استاپ به نقطه‌ی ورود (ریسک‌فری)
+                    pos["sl"] = pos["eff_entry"]
+                    sl = pos["sl"]
+                    hit_sl = (l <= sl) if direction == "BUY" else (h >= sl)
+
+        if hit_sl and hit_tp:
+            if manage_mode == "none":
+                res = resolve_both_hit_m15(direction, sl, tp, t)
+                if res == "tp":
+                    reasons["خروج_همزمان_حل_با_M15"] += 1
+                    return True, tp, "هر دو در یک کندل: M15 → حدسود"
+                if res == "sl":
+                    reasons["خروج_همزمان_حل_با_M15"] += 1
+                    return True, sl, "هر دو در یک کندل: M15 → حدضرر"
+                reasons["خروج_همزمان_بدون_M15_استاپ_فرض"] += 1
+            return True, sl, "هر دو در یک کندل: حدضرر"
+        if hit_sl:
+            if pos.get("managed") and manage_mode in ("partial2_be", "be2"):
+                return True, sl, "سربه‌سر (ریسک‌فری)"
+            return True, sl, "حدضرر"
+        if hit_tp:
+            return True, tp, "حدسود"
+        return False, None, None
+
+    def cancel_orders_of_zone(z, t_now, why_short, why_long):
+        """سفارش‌های پرنشده‌ی یک زون را وقتی زون بی‌اعتبار می‌شود لغو می‌کند."""
+        n = 0
+        for p in pending:
+            if p["active"] and not p["filled"] and p["z"] is z:
+                p["active"] = False
+                p["cancel"] = why_long
+                n += 1
+                log_event(events, t_now, symbol, z.zone_id, "Canceled", why_short)
+        return n
+
+    used=set()
+
+    for i in range(len(h4)):
+        t=h4["time"].iloc[i]
+
+        o=float(h4["open"].iloc[i]); h=float(h4["high"].iloc[i])
+        l=float(h4["low"].iloc[i]);  c=float(h4["close"].iloc[i])
+
+        di=last_idx_leq(d_times, t.to_datetime64())
+        if di<1 or i<1:
+            continue
+
+        # فیلترها فقط از کندل‌های «بسته‌شده» خوانده می‌شوند (بدون نگاه به آینده):
+        # کندل H4 قبلی و آخرین کندل روزانه‌ی کامل‌شده (di-1)
+        # تا وقتی فیلتر رنج «گرم» نشده (۲۰ کندل اول)، معامله ممنوع است
+        if pd.isna(d1["range"].iloc[di-1]) or pd.isna(h4["range"].iloc[i-1]):
+            continue
+
+        dtr=int(d1["trend"].iloc[di-1])
+        htr=int(h4["trend"].iloc[i-1])
+
+        drg=bool(d1["range"].iloc[di-1])
+        hrg=bool(h4["range"].iloc[i-1])
+
+        # کندل بسته‌شده‌ی قبلی برای چک‌های لغو (هفتگی و دور شدن قیمت)
+        o_prev=float(h4["open"].iloc[i-1]); c_prev=float(h4["close"].iloc[i-1])
+        h_prev=float(h4["high"].iloc[i-1]); l_prev=float(h4["low"].iloc[i-1])
+
+        # ---------- exits for already-open positions ----------
+        still_open=[]
+        for pos in open_pos:
+            exited, exit_price, reason = process_pos_candle(pos, h, l, t)
+            if exited:
+                finalize_trade(pos, t, float(exit_price), reason)
+            else:
+                still_open.append(pos)
+        open_pos = still_open
+
+        # ---------- touches + expiry (همان) ----------
+        for z in h_z:
+            # زون از کندلِ بعد از تأییدش فعال می‌شود (کندل تأیید باید اول بسته شود)
+            if z.created_time>=t or z.expired:
+                continue
+
+            # اگر زون جدیدِ هم‌پوشان آمده باشد، این زون از همان لحظه کنار می‌رود
+            if z.superseded_time is not None and t >= z.superseded_time:
+                z.expired=True
+                reasons["جایگزینی_زون"] += 1
+                # سفارش پرنشده‌ی این زون هم باید لغو شود (زون دیگر معتبر نیست)
+                reasons["لغو_سفارشِ_زون_باطل"] += cancel_orders_of_zone(
+                    z, t, "SupersededZone", "لغو: زون جدید هم‌پوشان جایگزین شد")
+                set_final(zone_df, z.zone_id, "منقضی شد", "زون جدید هم‌پوشان جایگزین شد", t)
+                log_event(events, t, symbol, z.zone_id, "Superseded", "")
+                continue
+
+            # زون شکسته باطل می‌شود: کندلِ بسته‌شده‌ی قبلی آن‌سوی دیستال‌لاین بسته شده باشد
+            # (زون‌هایی که قبلاً معامله یا رد شده‌اند شمرده نمی‌شوند تا آمار گمراه‌کننده نشود)
+            if invalidate_on_breach and id(z) not in used:
+                breached = (c_prev < z.distal) if z.direction == "BUY" else (c_prev > z.distal)
+                if breached:
+                    z.expired = True
+                    reasons["باطل_شدن_زون_شکسته"] += 1
+                    reasons["لغو_سفارشِ_زون_باطل"] += cancel_orders_of_zone(
+                        z, t, "ZoneBreached", "لغو: قیمت زون را شکست")
+                    set_final(zone_df, z.zone_id, "باطل شد", "قیمت از زون عبور کرد", t)
+                    log_event(events, t, symbol, z.zone_id, "Breached", "")
+                    continue
+
+            touched = (h >= z.low() and l <= z.high())
+            if touched:
+                if z.touch_count==0:
+                    z.touch_count=1; z.last_touch_i=i; z.clean_after_touch=0
+                    zone_df.loc[zone_df["ZoneID"]==z.zone_id, ["Touch1","تعداد_تست"]] = [t, 1]
+                    log_event(events, t, symbol, z.zone_id, "Touch1", "")
+                else:
+                    if z.clean_after_touch>=3 and z.last_touch_i is not None and (i - z.last_touch_i) <= 50:
+                        z.touch_count += 1
+                        z.last_touch_i=i; z.clean_after_touch=0
+                        zone_df.loc[zone_df["ZoneID"]==z.zone_id, ["Touch2","تعداد_تست"]] = [t, z.touch_count]
+                        log_event(events, t, symbol, z.zone_id, "Touch2", f"تست={z.touch_count}")
+                    else:
+                        z.clean_after_touch=0
+            else:
+                if z.touch_count>0:
+                    z.clean_after_touch += 1
+
+            if z.touch_count==1 and z.last_touch_i is not None and (i - z.last_touch_i) > 50:
+                z.expired=True
+                reasons["انقضا_زون"] += 1
+                # سفارش پرنشده‌ی زون منقضی هم لغو می‌شود
+                reasons["لغو_سفارشِ_زون_باطل"] += cancel_orders_of_zone(
+                    z, t, "ExpiredZone", "لغو: زون منقضی شد")
+                set_final(zone_df, z.zone_id, "منقضی شد", "Touch2 تا ۵۰ کندل نیامد", t)
+                log_event(events, t, symbol, z.zone_id, "Expired", "")
+
+        # ---------- انتخاب زون‌های واجد شرایط (کاندیدای سفارش) ----------
+        # زون‌هایی که از همه‌ی فیلترها رد شده‌اند اینجا فقط «کاندید» می‌شوند؛
+        # اینکه واقعاً سفارششان روی حساب برود یا نه، به سهمیه بستگی دارد.
+        candidates = []
+        for z in h_z:
+            if z.created_time>=t or z.expired or id(z) in used:
+                continue
+            if z.touch_count>=3:
+                reasons["لغو_به_خاطر_تست_سوم"] += 1
+                set_final(zone_df, z.zone_id, "رد شد", "تست سوم ممنوع", t)
+                log_event(events, t, symbol, z.zone_id, "Rejected", "تست سوم")
+                used.add(id(z)); continue
+            if z.touch_count==0:
+                continue
+
+            # رد به‌خاطر رنج/روند: به‌طور پیش‌فرض دائمی است؛ با retry_rejected_zones
+            # زون زنده می‌ماند و اگر بعداً شرایط سبز شد، دوباره فرصت می‌گیرد
+            if drg or hrg:
+                reasons["رد_به_خاطر_رنج"] += 1
+                if retry_rejected_zones:
+                    continue
+                set_final(zone_df, z.zone_id, "رد شد", "رنج", t)
+                log_event(events, t, symbol, z.zone_id, "Rejected", "رنج")
+                used.add(id(z)); continue
+
+            if dtr==0 or htr==0 or dtr!=htr:
+                reasons["رد_به_خاطر_روند"] += 1
+                if retry_rejected_zones:
+                    continue
+                set_final(zone_df, z.zone_id, "رد شد", "عدم هم‌جهتی روند D1 و H4", t)
+                log_event(events, t, symbol, z.zone_id, "Rejected", "روند")
+                used.add(id(z)); continue
+
+            # نکته: سقف سفارش هم‌زمان اینجا اعمال نمی‌شود. در ربات لایو هم زونی که
+            # فقط به‌خاطر پر بودن سهمیه جا نماند، «باطل» نمی‌شود بلکه در فهرست
+            # خواسته‌ها می‌ماند و به‌محض آزاد شدن سهمیه دوباره چیده می‌شود.
+            # اعمال سقف در بخش سهمیه‌بندی پایین‌تر انجام می‌گیرد.
+
+            # حاشیه‌ی سود (Odds Enhancer): حرکت اولیه‌ی زون باید حداقل N برابر ریسک جا داده باشد
+            if min_profit_margin_r > 0:
+                risk_h = 1.0 + entry_off + sl_off          # ریسک برحسب ارتفاع زون
+                if z.departure_h < min_profit_margin_r * risk_h:
+                    reasons["رد_به_خاطر_حاشیه_سود_کم"] += 1
+                    set_final(zone_df, z.zone_id, "رد شد", "حاشیه‌ی سود حرکت اولیه کم بود", t)
+                    log_event(events, t, symbol, z.zone_id, "Rejected", "ProfitMargin")
+                    used.add(id(z)); continue
+
+            # قدرت خروج (Odds Enhancer): بدنه‌ی کندل تأیید نسبت به ATR
+            if min_departure_atr > 0 and z.conf_body_atr < min_departure_atr:
+                reasons["رد_به_خاطر_خروج_ضعیف"] += 1
+                set_final(zone_df, z.zone_id, "رد شد", "خروج از زون به‌قدر کافی قوی نبود", t)
+                log_event(events, t, symbol, z.zone_id, "Rejected", "WeakDeparture")
+                used.add(id(z)); continue
+
+            # سقف اختیاری پوزیشن باز هر نماد (۰ = بدون محدودیت، مثل رفتار فعلی)
+            if max_open_per_symbol and len(open_pos) >= max_open_per_symbol:
+                reasons["رد_به_خاطر_سقف_پوزیشن_نماد"] += 1
+                set_final(zone_df, z.zone_id, "رد شد", "سقف پوزیشن باز این نماد", t)
+                log_event(events, t, symbol, z.zone_id, "Rejected", "سقف پوزیشن نماد")
+                used.add(id(z)); continue
+
+            # فیلتر حداقل اندازه‌ی زون: فاصله‌ی ورود تا استاپ باید حداقل min_risk_atr برابر ATR باشد
+            # (ATR از کندل قبلیِ بسته‌شده — بدون نگاه به آینده)
+            if min_risk_atr > 0:
+                atr_ref = h4["atr"].iloc[i-1]
+                height = z.high() - z.low()
+                risk_est = height * (1.0 + entry_off + sl_off)
+                if pd.isna(atr_ref) or risk_est < min_risk_atr * float(atr_ref):
+                    reasons["رد_به_خاطر_زون_کوچک"] += 1
+                    set_final(zone_df, z.zone_id, "رد شد", "زون خیلی کوچک (استاپ نزدیک)", t)
+                    log_event(events, t, symbol, z.zone_id, "Rejected", "SmallZone")
+                    used.add(id(z)); continue
+
+            candidates.append((z, 1 if z.touch_count==1 else 2))
+
+        # ---------- سفارش‌های «از پیش چیده» روی زون‌های لمس‌نشده ----------
+        # ربات لایو فقط کندل‌های بسته‌شده را می‌بیند، پس اگر منتظر لمس زون بماند
+        # ورودهای داخل کندل را از دست می‌دهد. برای همین روی نزدیک‌ترین زون‌های
+        # لمس‌نشده هم از قبل لیمیت می‌گذارد (فهرست armed در replay_state).
+        # این سفارش‌ها جای واقعی از سقف حساب اشغال می‌کنند — بدون مدل کردنشان
+        # بک‌تست خیلی خوش‌بینانه می‌شود.
+        armed_cands = []
+        if arm_untouched_zones and not (drg or hrg or dtr == 0 or htr == 0 or dtr != htr):
+            wz_arm = [wz for wz in w_z
+                      if wz.created_time + pd.Timedelta(days=7) <= t
+                      and (wz.superseded_time is None or t < wz.superseded_time)]
+            for z in h_z:
+                if z.created_time >= t or z.expired or id(z) in used:
+                    continue
+                if z.superseded_time is not None and t >= z.superseded_time:
+                    continue
+                if z.touch_count != 0:
+                    continue
+                opp_dir = "SELL" if z.direction == "BUY" else "BUY"
+                if any(body_overlaps_zone(o_prev, c_prev, wz) for wz in wz_arm if wz.direction == opp_dir):
+                    continue
+                if z.high() - z.low() <= 0:
+                    continue
+                armed_cands.append((z, 1))
+            armed_cands.sort(key=lambda zc: abs(c - zc[0].proximal))
+
+        # ---------- سهمیه‌بندی سفارش‌ها — عین sync_all ربات ----------
+        # فهرست خواسته‌های این نماد به همان ترتیب اولویت ربات:
+        # اول سفارش‌های روی حساب (جایشان را نگه می‌دارند)، بعد زون‌های لمس‌شده،
+        # و در آخر زون‌های لمس‌نشده به ترتیب نزدیکی به قیمت.
+        candidates.sort(key=lambda zc: abs(c - zc[0].proximal))
+        candidates = candidates + armed_cands
+        live_pending = [p for p in pending if p["active"] and not p["filled"]]
+        n_wanted = len(live_pending) + len(candidates)
+
+        if alloc_mode:
+            # منتظر راننده می‌مانیم تا بگوید چند سهمیه از سقف کل حساب گرفته‌ایم
+            n_slots = yield {"نماد": symbol, "t": t, "خواسته": n_wanted,
+                            "روی_حساب": len(live_pending)}
+            n_slots = int(n_slots or 0)
+        else:
+            n_slots = max_orders
+        n_slots = max(0, min(n_slots, max_orders))
+
+        # سفارش‌هایی که سهمیه‌شان را از دست داده‌اند برداشته می‌شوند (زون سالم می‌ماند)
+        for p in live_pending[n_slots:]:
+            p["active"] = False
+            p["cancel"] = "لغو: سهمیه‌ی سفارش کل حساب پر شد"
+            reasons["لغو_به_خاطر_سهمیه_کل_حساب"] += 1
+            used.discard(id(p["z"]))
+            set_final(zone_df, p["z"].zone_id, "لغو شد",
+                      f"سهمیه‌ی سفارش پر بود (سقف {LIVE_MAX_PENDING_TOTAL} کل حساب)", t)
+            log_event(events, t, symbol, p["z"].zone_id, "Canceled", "QuotaFull")
+
+        free = max(0, n_slots - min(len(live_pending), n_slots))
+        for z, test_no in candidates[:free]:
+            # در ربات، وقتی سقف پوزیشن باز کل حساب پر باشد سفارش تازه گذاشته نمی‌شود
+            if book is not None and book.open_total >= book.max_open_total:
+                reasons["رد_به_خاطر_سقف_پوزیشن_کل_حساب"] += 1
+                continue
+            pending.append(make_order(z, t, test_no))
+            set_final(zone_df, z.zone_id, "سفارش ثبت شد", "در انتظار پر شدن", t)
+            log_event(events, t, symbol, z.zone_id, "OrderPlaced", f"تست={test_no}")
+            used.add(id(z))
+        for z, _tn in candidates[free:]:
+            reasons["رد_به_خاطر_سقف_سفارش"] += 1
+
+        # ---------- weekly cancel BEFORE fill (همان) ----------
+        # زون هفتگی فقط بعد از بسته‌شدن کندل هفتگیِ تأیید (حدود ۷ روز بعد) معتبر است
+        wz_now=[wz for wz in w_z
+                if wz.created_time + pd.Timedelta(days=7) <= t
+                and (wz.superseded_time is None or t < wz.superseded_time)]
+        for p in pending:
+            if not p["active"] or p["filled"]:
+                continue
+            opp_dir = "SELL" if p["z"].direction=="BUY" else "BUY"
+            opp=[wz for wz in wz_now if wz.direction==opp_dir]
+            if any(body_overlaps_zone(o_prev,c_prev,wz) for wz in opp):
+                p["active"]=False
+                p["cancel"]="لغو: برخورد بدنه با زون مخالف هفتگی"
+                reasons["لغو_به_خاطر_هفتگی"] += 1
+                set_final(zone_df, p["z"].zone_id, "لغو شد", "زون مخالف هفتگی (بدنه)", t)
+                log_event(events, t, symbol, p["z"].zone_id, "Canceled", "WeeklyOpp")
+
+        # ---------- لغو به‌خاطر دور شدن قیمت بدون فعال شدن سفارش (اختیاری) ----------
+        if dist_cancel_r > 0:
+            for p in pending:
+                if not p["active"] or p["filled"]:
+                    continue
+                if p["z"].direction == "BUY":
+                    far = h_prev >= p["entry"] + dist_cancel_r * p["risk"]
+                else:
+                    far = l_prev <= p["entry"] - dist_cancel_r * p["risk"]
+                if far:
+                    p["active"] = False
+                    p["cancel"] = "لغو: دور شدن قیمت"
+                    reasons["لغو_به_خاطر_دور_شدن"] += 1
+                    set_final(zone_df, p["z"].zone_id, "لغو شد",
+                              f"قیمت {dist_cancel_r:g}R دور شد بدون ورود", t)
+                    log_event(events, t, symbol, p["z"].zone_id, "Canceled", "FarAway")
+
+        # ---------- fills + (NEW) exit-same-bar ----------
+        new_open_positions = []
+        for p in pending:
+            if not p["active"] or p["filled"]:
+                continue
+
+            if drg or hrg or dtr==0 or htr==0 or dtr!=htr:
+                p["active"]=False
+                p["cancel"]="لغو: عدم هم‌جهتی/رنج در لحظه ورود"
+                reasons["لغو_به_خاطر_رنج_یا_روند_لحظه_ورود"] += 1
+                set_final(zone_df, p["z"].zone_id, "لغو شد", "عدم هم‌جهتی/رنج در لحظه ورود", t)
+                log_event(events, t, symbol, p["z"].zone_id, "Canceled", "Trend/Range at Fill")
+                continue
+
+            filled_now = False
+            direction = p["z"].direction
+
+            if direction=="BUY" and l <= p["entry"]:
+                filled_now = True
+            elif direction=="SELL" and h >= p["entry"]:
+                filled_now = True
+
+            if not filled_now:
+                continue
+
+            p["filled"]=True; p["fill_time"]=t
+            reasons["ورود_انجام_شد"] += 1
+            zone_df.loc[zone_df["ZoneID"]==p["z"].zone_id, "زمان_پرشدن"] = t
+            log_event(events, t, symbol, p["z"].zone_id, "Filled", "")
+
+            if book is not None:
+                # حجم از روی اکویتیِ حساب مشترک و وزن سشنِ همان لحظه — عین ربات
+                risk_amt = book.risk_amount(t)
+                book.open_total += 1
+            else:
+                usable = equity*(1.0 - reserve)
+                risk_amt = usable*risk_per_trade
+
+            trigger = (p["eff_entry"] + MANAGE_TRIGGER_R * p["risk"]) if direction == "BUY" \
+                else (p["eff_entry"] - MANAGE_TRIGGER_R * p["risk"])
+            pos = {
+                "ZoneID": p["z"].zone_id,
+                "direction": direction,
+                "eff_entry": float(p["eff_entry"]),
+                "sl": float(p["sl"]),
+                "tp": float(p["tp"]),
+                "risk": float(p["risk"]),
+                "risk_amt": float(risk_amt),
+                "fill_time": t,
+                "test": p["test"],
+                "z": p["z"],
+                "trigger": float(trigger),
+                "managed": False,
+            }
+
+            # کندل ورود: با M15 لحظه‌ی پر شدن و ترتیب استاپ/حدسود دقیق مشخص می‌شود
+            res = resolve_entry_candle_m15(direction, p["entry"], pos["sl"], pos["tp"], t) \
+                if manage_mode == "none" else None
+            if res == "sl":
+                reasons["کندل_ورود_حل_با_M15"] += 1
+                finalize_trade(pos, t, float(pos["sl"]), "حدضرر (کندل ورود، M15)")
+            elif res == "tp":
+                reasons["کندل_ورود_حل_با_M15"] += 1
+                finalize_trade(pos, t, float(pos["tp"]), "حدسود (کندل ورود، M15)")
+            elif res == "open":
+                new_open_positions.append(pos)
+            else:
+                # بدون M15: بدبینانه (اگر هر دو لمس شد، استاپ) + اعمال مدیریت سیوسود/ریسک‌فری
+                exited, exit_price, reason = process_pos_candle(pos, h, l, t)
+                if exited:
+                    if "حدسود" in str(reason):
+                        reasons["TP_کندل_ورود_بدون_M15"] += 1
+                    finalize_trade(pos, t, float(exit_price), reason)
+                else:
+                    new_open_positions.append(pos)
+
+            p["active"] = False
+
+        open_pos.extend(new_open_positions)
+        pending=[x for x in pending if x["active"] and (not x["filled"])]
+
+    # ---------- پایان دیتا ----------
+    endt = h4["time"].iloc[-1] if len(h4)>0 else None
+    if endt is not None:
+        # بستن پوزیشن‌های باز با close آخر
+        c_last = float(h4["close"].iloc[-1])
+        for pos in open_pos:
+            finalize_trade(pos, endt, c_last, "پایان دیتا")
+
+        # finalize zones
+        for zid in zone_df["ZoneID"].tolist():
+            if str(zone_df.loc[zone_df["ZoneID"]==zid, "FinalStatus"].iloc[0]).strip()=="":
+                set_final(zone_df, zid, "بدون لمس", "تا پایان دیتا لمس نشد", endt)
+
+        for p in pending:
+            if p["active"] and (not p["filled"]):
+                set_final(zone_df, p["z"].zone_id, "سفارش پر نشد", "تا پایان دیتا پر نشد", endt)
+                log_event(events, endt, symbol, p["z"].zone_id, "Unfilled", "")
+
+    tdf=pd.DataFrame(trades)
+    if tdf.empty:
+        metrics={
+            "نماد":symbol,"تعداد":0,"درصد_برد":0.0,"فاکتور_سود":0.0,
+            "بازده_خالص٪":0.0,"حداکثر_افت٪":0.0,"میانگین_R":0.0,
+            "مبهم_تعداد":0,"مبهم_درصد":0.0,
+            "بازده٪_اگر_مبهم_TP":0.0,"بازده٪_اگر_مبهم_استاپ":0.0,
+            "فاصله_استاپ_پیپ":0.0,"فاصله_TP_پیپ":0.0,
+            "برد_همان_کندل_تعداد":0,"بازده٪_اگر_برد_همان_کندل_استاپ":0.0
+        }
+    else:
+        wins=tdf.loc[tdf["نتیجه_R"]>0,"نتیجه_R"].sum()
+        loss=tdf.loc[tdf["نتیجه_R"]<0,"نتیجه_R"].abs().sum()
+        pf=float(wins/loss) if loss>0 else 999.0
+        winrate=float((tdf["نتیجه_R"]>0).mean()*100.0)
+        net=float((equity-100000.0)/100000.0*100.0)
+
+        # --- تحلیل معاملات مبهم (TP و استاپ هر دو در یک کندل H4 لمس شده) ---
+        amb = tdf["علت_خروج"].astype(str).str.contains("هر دو در یک کندل")
+        n_amb = int(amb.sum())
+
+        def _net_with(r_series):
+            eq = 100000.0
+            for r in r_series:
+                eq += eq * (1.0 - reserve) * risk_per_trade * float(r)
+            return round((eq - 100000.0) / 100000.0 * 100.0, 2)
+
+        risk_d = (tdf["ورود"] - tdf["حدضرر"]).abs().replace(0, np.nan)
+        r_if_tp = (tdf["حدسود"] - tdf["ورود"]).abs() / risk_d - commission_cost / risk_d
+        rs_if_tp = tdf["نتیجه_R"].where(~amb, r_if_tp).fillna(tdf["نتیجه_R"])
+        net_if_tp = _net_with(rs_if_tp)      # اگر همه‌ی مبهم‌ها TP بودند
+        net_if_sl = _net_with(tdf["نتیجه_R"])  # مبهم‌ها همین حالا استاپ حساب شده‌اند
+
+        # --- فاصله‌ی استاپ و حدسود به پیپ ---
+        if symbol.endswith("JPY"):
+            pip = 0.01
+        elif symbol == "XAUUSD":
+            pip = 0.1
+        elif symbol == "XAGUSD":
+            pip = 0.01
+        else:
+            pip = 0.0001
+        sl_pips = float(((tdf["ورود"] - tdf["حدضرر"]).abs() / pip).mean())
+        tp_pips = float(((tdf["حدسود"] - tdf["ورود"]).abs() / pip).mean())
+
+        # --- بردهای همان‌کندل (خروج در همان کندل ورود) و سناریوی کف: همه استاپ ---
+        same_win = (pd.to_datetime(tdf["زمان_ورود"]) == pd.to_datetime(tdf["زمان_خروج"])) & (tdf["نتیجه_R"] > 0)
+        n_sw = int(same_win.sum())
+        r_if_sl = -1.0 - commission_cost / risk_d
+        rs_floor = tdf["نتیجه_R"].where(~same_win, r_if_sl).fillna(tdf["نتیجه_R"])
+        net_floor = _net_with(rs_floor)
+
+        metrics={
+            "نماد":symbol,"تعداد":int(len(tdf)),"درصد_برد":round(winrate,2),
+            "فاکتور_سود":round(pf,3),"بازده_خالص٪":round(net,2),
+            "حداکثر_افت٪":round(max_dd*100.0,2),"میانگین_R":round(float(tdf["نتیجه_R"].mean()),3),
+            "مبهم_تعداد":n_amb,"مبهم_درصد":round(n_amb/len(tdf)*100.0,2),
+            "بازده٪_اگر_مبهم_TP":net_if_tp,"بازده٪_اگر_مبهم_استاپ":net_if_sl,
+            "فاصله_استاپ_پیپ":round(sl_pips,1),"فاصله_TP_پیپ":round(tp_pips,1),
+            "برد_همان_کندل_تعداد":n_sw,"بازده٪_اگر_برد_همان_کندل_استاپ":net_floor
+        }
+
+    reasons_df=pd.DataFrame([{"نماد":symbol,"دلیل":k,"تعداد":int(v)} for k,v in reasons.items()])
+    metrics_df=pd.DataFrame([metrics])
+    events_df=pd.DataFrame(events)
+
+    z_reason = zone_df.groupby(["نماد","FinalStatus","FinalReason"]).size().reset_index(name="تعداد")
+    z_reason["درصد"] = z_reason.groupby("نماد")["تعداد"].transform(lambda s: (s/s.sum()*100.0).round(2))
+
+    if return_state:
+        # وضعیت «همین الان» برای ربات لایو: سفارش‌های در انتظارِ فعال و پوزیشن‌های باز
+        state = {
+            "pending": [{
+                "zone_id": p["z"].zone_id, "direction": p["z"].direction,
+                "entry": float(p["entry"]), "sl": float(p["sl"]), "tp": float(p["tp"]),
+                "placed_time": p["t"], "test": p["test"],
+            } for p in pending if p["active"] and not p["filled"]],
+            "open": [{
+                "zone_id": pos["ZoneID"], "direction": pos["direction"],
+                "entry": float(pos["eff_entry"]), "sl": float(pos["sl"]), "tp": float(pos["tp"]),
+                "fill_time": pos["fill_time"],
+            } for pos in open_pos],
+            "armed": [],
+            "فیلتر_توضیح": "",
+            "دلیل_نبود": "",
+            # دلیل نهایی هر زون (برای اینکه ربات لایو بداند چرا سفارشی دیگر معتبر نیست)
+            "دلایل_زون": {
+                str(r["ZoneID"]): f"{str(r['FinalStatus']).strip()} — {str(r['FinalReason']).strip()}"
+                for _, r in zone_df.iterrows()
+                if str(r.get("FinalStatus", "")).strip()
+            },
+        }
+
+        # زون‌های «آماده‌باش» برای لایو: هنوز تاچ نشده‌اند ولی اگر قیمت وسط کندل بیاید،
+        # سفارش از قبل داخل متاتریدر هست و جا نمی‌مانیم (معادل پر شدن داخل کندل در بک‌تست).
+        if len(h4) >= 2 and len(d1) >= 2:
+            t_last = h4["time"].iloc[-1]
+            o_last = float(h4["open"].iloc[-1]); c_last = float(h4["close"].iloc[-1])
+            drg_now = d1["range"].iloc[-1]; hrg_now = h4["range"].iloc[-1]
+            dtr_now = int(d1["trend"].iloc[-1]); htr_now = int(h4["trend"].iloc[-1])
+            warm = (not pd.isna(drg_now)) and (not pd.isna(hrg_now))
+            filters_ok = warm and (not bool(drg_now)) and (not bool(hrg_now)) \
+                and dtr_now != 0 and htr_now == dtr_now
+
+            trend_txt = {1: "صعودی", -1: "نزولی", 0: "بدون روند"}
+            state["فیلتر_توضیح"] = (
+                f"روند روزانه: {trend_txt.get(dtr_now)} | روند H4: {trend_txt.get(htr_now)} | "
+                f"رنج روزانه: {'بله' if warm and bool(drg_now) else 'خیر'} | "
+                f"رنج H4: {'بله' if warm and bool(hrg_now) else 'خیر'}"
+            )
+
+            # دلیل دقیق نبودِ معامله (برای عیب‌یابی زنده)
+            blockers = []
+            if not warm:
+                blockers.append("اندیکاتورها هنوز آماده نیستند")
+            else:
+                if bool(drg_now):
+                    blockers.append("بازار روزانه رنج است")
+                if bool(hrg_now):
+                    blockers.append("بازار ۴ساعته رنج است")
+                if dtr_now == 0:
+                    blockers.append("روند روزانه مشخص نیست")
+                if htr_now == 0:
+                    blockers.append("روند ۴ساعته مشخص نیست")
+                if dtr_now != 0 and htr_now != 0 and dtr_now != htr_now:
+                    blockers.append(f"روند روزانه {trend_txt.get(dtr_now)} ولی ۴ساعته {trend_txt.get(htr_now)} (ناهم‌جهت)")
+            state["دلیل_نبود"] = " + ".join(blockers) if blockers else "فیلترها سبزند"
+
+            if filters_ok:
+                wz_now = [wz for wz in w_z
+                          if wz.created_time + pd.Timedelta(days=7) <= t_last
+                          and (wz.superseded_time is None or t_last < wz.superseded_time)]
+                armed = []
+                for z in h_z:
+                    if z.created_time >= t_last or z.expired or id(z) in used:
+                        continue
+                    if z.superseded_time is not None and t_last >= z.superseded_time:
+                        continue
+                    if z.touch_count != 0:
+                        continue
+                    opp_dir = "SELL" if z.direction == "BUY" else "BUY"
+                    if any(body_overlaps_zone(o_last, c_last, wz) for wz in wz_now if wz.direction == opp_dir):
+                        continue
+                    height = z.high() - z.low()
+                    if height <= 0:
+                        continue
+                    if z.direction == "BUY":
+                        entry = z.proximal + entry_off * height
+                        sl = z.distal - sl_off * height
+                        risk = entry - sl
+                        tp = entry + rr * risk
+                    else:
+                        entry = z.proximal - entry_off * height
+                        sl = z.distal + sl_off * height
+                        risk = sl - entry
+                        tp = entry - rr * risk
+                    if risk <= 0:
+                        continue
+                    armed.append({"zone_id": z.zone_id, "direction": z.direction,
+                                  "entry": float(entry), "sl": float(sl), "tp": float(tp),
+                                  "placed_time": t_last, "test": 0,
+                                  "dist": float(abs(c_last - z.proximal))})
+                # نزدیک‌ترین زون‌ها به قیمت، تا سقف سفارش هم‌زمانِ هر نماد
+                armed.sort(key=lambda a: a["dist"])
+                n_slots = max(0, max_orders - len(state["pending"]))
+                state["armed"] = armed[:n_slots]
+
+        return metrics_df, reasons_df, tdf, zone_df, events_df, z_reason, state
+
+    return metrics_df, reasons_df, tdf, zone_df, events_df, z_reason
+
+
+def backtest_one(*args, **kwargs):
+    """اجرای تک‌نمادی (رفتار قبلی، بدون تغییر).
+
+    موتور را تنها اجرا می‌کند و در هر سهمیه‌بندی، سقف خودِ نماد را کامل به آن
+    می‌دهد — یعنی همان «هر چارت تا ۳ سفارش، بدون توجه به بقیه‌ی حساب».
+    """
+    kwargs.pop("alloc_mode", None)
+    max_orders = kwargs.get("max_orders", 3)
+    gen = _backtest_core(*args, alloc_mode=False, **kwargs)
+    reply = None
+    while True:
+        try:
+            gen.send(reply)
+        except StopIteration as stop:
+            return stop.value
+        reply = max_orders
+
+
+def portfolio_live_replay(symbol_frames, spreads, entry_off=None, sl_off=None, rr=None,
+                          manage_mode=None, risk_per_trade=None, reserve=None,
+                          start_equity=None, max_pending_total=None, max_open_total=None,
+                          max_pending_per_symbol=None, basket_order=None,
+                          session_weights=None, **core_kwargs):
+    """بک‌تست «عین لایو»: همه‌ی نمادها هم‌زمان روی یک حساب مشترک.
+
+    هر نماد یک موتور مستقل دارد ولی همه کندل‌به‌کندل با هم جلو می‌روند. سر هر کندل،
+    درست مثل sync_all ربات، سهمیه‌ی سفارش‌ها به‌صورت دوری تقسیم می‌شود:
+    دور اول یک سفارش به هر نماد، بعد دور دوم و سوم — تا وقتی سقف کل حساب پر شود.
+
+    symbol_frames: دیکشنری {نماد: (h4, d1, w1, m15)}
+    """
+    entry_off = DEFAULT_ENTRY_OFF if entry_off is None else entry_off
+    sl_off = DEFAULT_SL_OFF if sl_off is None else sl_off
+    rr = DEFAULT_RR if rr is None else rr
+    manage_mode = DEFAULT_MANAGE if manage_mode is None else manage_mode
+    risk_per_trade = LIVE_RISK_PER_TRADE if risk_per_trade is None else risk_per_trade
+    reserve = LIVE_RESERVE if reserve is None else reserve
+    start_equity = LIVE_START_EQUITY if start_equity is None else start_equity
+    max_pending_total = LIVE_MAX_PENDING_TOTAL if max_pending_total is None else max_pending_total
+    max_open_total = LIVE_MAX_OPEN_TOTAL if max_open_total is None else max_open_total
+    max_per_sym = LIVE_MAX_PENDING_PER_SYMBOL if max_pending_per_symbol is None else max_pending_per_symbol
+    if session_weights is None and USE_DEFAULT_SESSION_WEIGHTS:
+        session_weights = DEFAULT_SESSION_WEIGHTS
+
+    # ترتیب نمادها = ترتیب اولویت در سهمیه‌بندی دوری (عین BASKET ربات)
+    order = [s for s in (basket_order or LIVE_BASKET_ORDER) if s in symbol_frames]
+    order += [s for s in symbol_frames if s not in order]
+
+    book = AccountBook(start_equity=start_equity, reserve=reserve,
+                       risk_per_trade=risk_per_trade, session_weights=session_weights,
+                       max_open_total=max_open_total)
+
+    gens, reqs, results = {}, {}, {}
+    for sym in order:
+        h4, d1, w1, m15 = symbol_frames[sym]
+        gen = _backtest_core(sym, h4, d1, w1, None, spreads.get(sym, 0.0),
+                             entry_off=entry_off, sl_off=sl_off, rr=rr,
+                             reserve=reserve, risk_per_trade=risk_per_trade,
+                             max_orders=max_per_sym, m15=m15, manage_mode=manage_mode,
+                             book=book, alloc_mode=True,
+                             arm_untouched_zones=LIVE_ARM_UNTOUCHED, **core_kwargs)
+        try:
+            reqs[sym] = gen.send(None)
+        except StopIteration as stop:
+            results[sym] = stop.value
+            continue
+        gens[sym] = gen
+
+    # حلقه‌ی زمانیِ مشترک: در هر گام، نمادهایی که روی قدیمی‌ترین کندل ایستاده‌اند
+    # جواب سهمیه می‌گیرند و یک کندل جلو می‌روند.
+    alloc_log = []
+    while gens:
+        t_min = min(r["t"] for r in reqs.values())
+        group = [s for s in order if s in gens and reqs[s]["t"] == t_min]
+
+        # سهمیه‌بندی دوری روی خواسته‌ی همه‌ی نمادهای زنده — عین حلقه‌ی range(3) ربات
+        alloc = {s: 0 for s in gens}
+        total = 0
+        for _round in range(max_per_sym):
+            for s in order:
+                if s not in gens or total >= max_pending_total:
+                    continue
+                if reqs[s]["خواسته"] > alloc[s]:
+                    alloc[s] += 1
+                    total += 1
+
+        alloc_log.append({"زمان": t_min, "سفارش_تخصیص‌یافته": total,
+                          "پوزیشن_باز": book.open_total, "اکویتی": round(book.equity, 2)})
+
+        for s in group:
+            try:
+                reqs[s] = gens[s].send(alloc[s])
+            except StopIteration as stop:
+                results[s] = stop.value
+                gens.pop(s, None)
+                reqs.pop(s, None)
+
+    return results, book, pd.DataFrame(alloc_log)
+
+# ---------------- PDFs ----------------
+def _parse_version_tuple(name: str):
+    """
+    تبدیل Z_v1.4 -> (1,4) برای مرتب‌سازی نسخه‌ها
+    اگر قابل تشخیص نبود None برمی‌گرداند.
+    """
+    m = re.search(r'Z_v(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?', name)
+    if not m:
+        return None
+    nums = [int(x) for x in m.groups() if x is not None]
+    return tuple(nums) if nums else None
+
+def _find_baseline_metrics_path(current_dir: str):
+    """
+    تلاش می‌کند نتایج نسخه قبلی را پیدا کند:
+    - در پوشه والد، فولدرهای Z_v* را پیدا می‌کند
+    - نزدیک‌ترین نسخه کوچک‌تر از نسخه فعلی را انتخاب می‌کند
+    - سپس مسیر خروجی/نتایج_اعدادی.xlsx را برمی‌گرداند اگر وجود داشته باشد
+    """
+    parent = os.path.dirname(current_dir)
+    cur_name = os.path.basename(current_dir)
+    cur_ver = _parse_version_tuple(cur_name)
+
+    candidates = []
+    for d in os.listdir(parent):
+        p = os.path.join(parent, d)
+        if d == cur_name or (not os.path.isdir(p)):
+            continue
+        if not d.startswith("Z_v"):
+            continue
+        vt = _parse_version_tuple(d)
+        if vt is None:
+            continue
+        candidates.append((vt, d))
+
+    if not candidates or cur_ver is None:
+        return None
+
+    # انتخاب بزرگ‌ترین نسخه‌ای که از نسخه فعلی کوچک‌تر باشد
+    smaller = [c for c in candidates if c[0] < cur_ver]
+    if not smaller:
+        return None
+    smaller.sort(key=lambda x: x[0])
+    prev_dir = smaller[-1][1]
+    baseline_new = os.path.join(parent, prev_dir, "خروجی", "خلاصه_نتایج.xlsx")
+    baseline_old = os.path.join(parent, prev_dir, "خروجی", "نتایج_اعدادی.xlsx")
+    if os.path.isfile(baseline_new):
+        return baseline_new
+    return baseline_old if os.path.isfile(baseline_old) else None
+
+def augment_metrics_with_change_review(metrics_df: pd.DataFrame, current_dir: str, years: int,
+                                       book=None):
+    """
+    به metrics_df ستون‌های مقایسه با نسخه قبلی اضافه می‌کند (اگر پیدا شود).
+    همچنین یک ردیف «کل» اضافه می‌کند که KPIهای وزنی را نشان می‌دهد.
+
+    اگر book داده شود (حالت «عین لایو»)، بازده و افتِ ردیف «کل» از خود حساب
+    مشترک خوانده می‌شود — نه میانگین/بیشینه‌ی ستون‌ها که در این حالت گمراه‌کننده است.
+    """
+    df = metrics_df.copy()
+
+    # KPI کل (وزنی بر اساس تعداد معاملات)
+    total_trades = int(df["تعداد"].sum()) if "تعداد" in df.columns else 0
+    if total_trades > 0:
+        est_wins = (df["تعداد"] * df["درصد_برد"] / 100.0).sum()
+        win_all = float(est_wins / total_trades * 100.0)
+        pf_w = float((df["فاکتور_سود"] * df["تعداد"]).sum() / total_trades)
+        r_w = float((df["میانگین_R"] * df["تعداد"]).sum() / total_trades)
+        worst_dd = float(df["حداکثر_افت٪"].max())
+        # تقریب بازده پرتفوی وزن مساوی
+        wealth = (1.0 + df["بازده_خالص٪"] / 100.0).mean()
+        port_return = (wealth - 1.0) * 100.0
+        port_monthly = (wealth ** (1.0 / (years * 12.0)) - 1.0) * 100.0
+    else:
+        win_all = pf_w = r_w = worst_dd = port_return = port_monthly = 0.0
+
+    if book is not None and total_trades > 0:
+        # حالت «عین لایو»: بازده و افت واقعیِ همان یک حساب، نه میانگین ستون‌ها.
+        # (ستون‌های هر نماد در این حالت «سهم آن نماد از بازده حساب» هستند و
+        #  جمعشان بازده کل می‌شود؛ پس میانگین گرفتن از آن‌ها بی‌معنی است.)
+        wealth = book.equity / book.start_equity if book.start_equity else 1.0
+        port_return = (wealth - 1.0) * 100.0
+        worst_dd = book.max_dd * 100.0
+        port_monthly = ((wealth ** (1.0 / (years * 12.0)) - 1.0) * 100.0) if years else 0.0
+
+    summary_row = {
+        "نماد": "کل",
+        "تعداد": total_trades,
+        "درصد_برد": round(win_all, 2),
+        "فاکتور_سود": round(pf_w, 3),
+        "بازده_خالص٪": round(port_return, 2),
+        "حداکثر_افت٪": round(worst_dd, 2),
+        "میانگین_R": round(r_w, 3),
+        "CAGR_ماهانه_% (تقریب وزن‌مساوی)": round(port_monthly, 2),
+    }
+
+    # Baseline
+    baseline_path = _find_baseline_metrics_path(current_dir)
+    if baseline_path:
+        try:
+            base = pd.read_excel(baseline_path)
+            # merge on symbol
+            m = df.merge(base, on="نماد", how="left", suffixes=("", "_Baseline"))
+            # اضافه کردن نمادهای حذف‌شده (در Baseline بوده‌اند ولی در این نسخه نیستند)
+            removed_syms = [x for x in base["نماد"].unique().tolist() if x not in df["نماد"].unique().tolist()]
+            if removed_syms:
+                removed_rows = base[base["نماد"].isin(removed_syms)].copy()
+                # ستون‌های فعلی را خالی می‌کنیم و فقط ستون‌های Baseline را نگه می‌داریم
+                for col in df.columns:
+                    if col != "نماد":
+                        removed_rows[col] = np.nan
+                # نام ستون‌های Baseline را با پسوند هماهنگ می‌کنیم
+                for col in list(base.columns):
+                    if col != "نماد":
+                        removed_rows.rename(columns={col: f"{col}_Baseline"}, inplace=True)
+                removed_rows["نتیجه_تغییر"] = "حذف شد"
+                # هم‌ستون‌سازی با m
+                for col in m.columns:
+                    if col not in removed_rows.columns:
+                        removed_rows[col] = np.nan
+                removed_rows = removed_rows[m.columns]
+                m = pd.concat([m, removed_rows], ignore_index=True)
+
+            # deltas
+            for col in ["درصد_برد", "فاکتور_سود", "بازده_خالص٪", "حداکثر_افت٪", "میانگین_R", "تعداد"]:
+                bcol = f"{col}_Baseline"
+                if bcol in m.columns:
+                    m[f"Δ{col}"] = m[col] - m[bcol]
+            # status
+            def status_row(r):
+                if pd.isna(r.get("درصد_برد_Baseline")):
+                    return "جدید/بدون مقایسه"
+                score = 0
+                score += 1 if r.get("Δدرصد_برد", 0) >= 0 else -1
+                score += 1 if r.get("Δفاکتور_سود", 0) >= 0 else -1
+                # دراودان کمتر بهتر است
+                score += 1 if r.get("Δحداکثر_افت٪", 0) <= 0 else -1
+                score += 1 if r.get("Δبازده_خالص٪", 0) >= 0 else -1
+                if score >= 2:
+                    return "بهتر"
+                if score <= -2:
+                    return "بدتر"
+                return "مخلوط/نامشخص"
+            m["نتیجه_تغییر"] = m.apply(status_row, axis=1)
+
+            # baseline portfolio KPI
+            if "تعداد" in base.columns and base["تعداد"].sum() > 0:
+                bt = int(base["تعداد"].sum())
+                bw = (base["تعداد"] * base["درصد_برد"] / 100.0).sum()
+                bwin = float(bw / bt * 100.0)
+                bpf = float((base["فاکتور_سود"] * base["تعداد"]).sum() / bt)
+                br = float((base["میانگین_R"] * base["تعداد"]).sum() / bt)
+                bdd = float(base["حداکثر_افت٪"].max())
+                bwealth = (1.0 + base["بازده_خالص٪"] / 100.0).mean()
+                bret = (bwealth - 1.0) * 100.0
+                bmon = (bwealth ** (1.0 / (years * 12.0)) - 1.0) * 100.0
+            else:
+                bt=bwin=bpf=br=bdd=bret=bmon=0.0
+
+            # attach baseline numbers into summary row
+            summary_row.update({
+                "تعداد_Baseline": bt,
+                "درصد_برد_Baseline": round(bwin, 2),
+                "فاکتور_سود_Baseline": round(bpf, 3),
+                "بازده_خالص٪_Baseline": round(bret, 2),
+                "حداکثر_افت٪_Baseline": round(bdd, 2),
+                "میانگین_R_Baseline": round(br, 3),
+                "CAGR_ماهانه_% (تقریب وزن‌مساوی)_Baseline": round(bmon, 2),
+                "Δدرصد_برد": round(win_all - bwin, 2),
+                "Δفاکتور_سود": round(pf_w - bpf, 3),
+                "Δبازده_خالص٪": round(port_return - bret, 2),
+                "Δحداکثر_افت٪": round(worst_dd - bdd, 2),
+                "Δمیانگین_R": round(r_w - br, 3),
+            })
+            # overall status
+            overall_score = 0
+            overall_score += 1 if (win_all - bwin) >= 0 else -1
+            overall_score += 1 if (pf_w - bpf) >= 0 else -1
+            overall_score += 1 if (worst_dd - bdd) <= 0 else -1
+            overall_score += 1 if (port_return - bret) >= 0 else -1
+            summary_row["نتیجه_تغییر"] = "بهتر" if overall_score >= 2 else ("بدتر" if overall_score <= -2 else "مخلوط/نامشخص")
+            summary_row["BaselineFile"] = os.path.basename(os.path.dirname(baseline_path))
+            df_out = m
+        except Exception:
+            df_out = df
+            summary_row["نتیجه_تغییر"] = "Baseline یافت شد ولی خوانده نشد"
+    else:
+        df_out = df
+        summary_row["نتیجه_تغییر"] = "Baseline یافت نشد"
+
+    # اضافه کردن ردیف کل
+    df_out = pd.concat([df_out, pd.DataFrame([summary_row])], ignore_index=True)
+    return df_out, baseline_path
+
+# ---------------- Main ----------------
+def session_analysis(trades_df):
+    """تحلیل عملکرد استراتژی بر اساس سشن معاملاتی (از روی ساعت ورود).
+    معیار اصلی «مجموع R» است چون قابل جمع‌زدن و منصفانه است."""
+    if trades_df is None or trades_df.empty:
+        return None, None, None
+    t = trades_df.copy()
+    t["زمان_ورود"] = pd.to_datetime(t["زمان_ورود"], errors="coerce")
+    t = t.dropna(subset=["زمان_ورود", "نتیجه_R"])
+    if t.empty:
+        return None, None, None
+
+    t["ساعت_UTC"] = (t["زمان_ورود"].dt.hour + SESSION_HOUR_SHIFT) % 24
+    t["سشن"] = t["ساعت_UTC"].apply(hour_to_session)
+    total_r = float(t["نتیجه_R"].sum())
+
+    def _agg(g):
+        n = len(g)
+        wins = int((g["نتیجه_R"] > 0).sum())
+        sum_r = float(g["نتیجه_R"].sum())
+        return pd.Series({
+            "تعداد": n,
+            "درصد_برد": round(wins / n * 100.0, 2) if n else 0.0,
+            "میانگین_R": round(sum_r / n, 3) if n else 0.0,
+            "مجموع_R": round(sum_r, 1),
+            "سهم_از_کل_سود٪": round(sum_r / total_r * 100.0, 1) if total_r else 0.0,
+        })
+
+    by_session = t.groupby("سشن").apply(_agg).reset_index().sort_values("مجموع_R", ascending=False)
+    by_hour = t.groupby(["ساعت_UTC"]).apply(_agg).reset_index().sort_values("ساعت_UTC")
+
+    # جدول متقاطع نماد × سشن (مجموع R و میانگین R)
+    piv_sum = t.pivot_table(index="نماد", columns="سشن", values="نتیجه_R", aggfunc="sum").round(1)
+    piv_cnt = t.pivot_table(index="نماد", columns="سشن", values="نتیجه_R", aggfunc="count")
+    piv = piv_sum.copy()
+    piv.columns = [f"{c} (مجموع R)" for c in piv.columns]
+    for c in piv_cnt.columns:
+        piv[f"{c} (تعداد)"] = piv_cnt[c]
+    piv = piv.reset_index()
+
+    return by_session, by_hour, piv
+
+
+def session_stability(trades_df):
+    """تست پایداری سشن‌ها: دیتا را از وسط دو نیم می‌کند و می‌بیند آیا
+    رتبه‌بندی سشن‌ها در هر دو نیمه یکسان می‌ماند (ضد بهینه‌سازی روی گذشته)."""
+    if trades_df is None or trades_df.empty:
+        return None
+    t = trades_df.copy()
+    t["زمان_ورود"] = pd.to_datetime(t["زمان_ورود"], errors="coerce")
+    t = t.dropna(subset=["زمان_ورود", "نتیجه_R"]).sort_values("زمان_ورود")
+    if len(t) < 20:
+        return None
+
+    t["ساعت_UTC"] = (t["زمان_ورود"].dt.hour + SESSION_HOUR_SHIFT) % 24
+    t["سشن"] = t["ساعت_UTC"].apply(hour_to_session)
+    mid = t["زمان_ورود"].iloc[len(t) // 2]
+    first, second = t[t["زمان_ورود"] < mid], t[t["زمان_ورود"] >= mid]
+
+    rows = []
+    for name in [r[2] for r in SESSION_RANGES]:
+        g1, g2 = first[first["سشن"] == name], second[second["سشن"] == name]
+        if g1.empty and g2.empty:
+            continue
+        a1 = float(g1["نتیجه_R"].mean()) if len(g1) else 0.0
+        a2 = float(g2["نتیجه_R"].mean()) if len(g2) else 0.0
+        s1, s2 = float(g1["نتیجه_R"].sum()), float(g2["نتیجه_R"].sum())
+        if s1 > 0 and s2 > 0:
+            verdict = "✅ پایدار (در هر دو نیمه سودده)"
+        elif s1 < 0 and s2 < 0:
+            verdict = "❌ پایدار (در هر دو نیمه ضررده)"
+        else:
+            verdict = "⚠️ ناپایدار (فقط در یک نیمه سودده)"
+        rows.append({
+            "سشن": name,
+            "نیمه۱_تعداد": len(g1), "نیمه۱_میانگین_R": round(a1, 3), "نیمه۱_مجموع_R": round(s1, 1),
+            "نیمه۲_تعداد": len(g2), "نیمه۲_میانگین_R": round(a2, 3), "نیمه۲_مجموع_R": round(s2, 1),
+            "نتیجه": verdict,
+        })
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values("نیمه۲_مجموع_R", ascending=False)
+        out.attrs["mid"] = str(mid)
+    return out
+
+
+def _aggregate_mode_rows(rows, mode_col):
+    """جدول مقایسه‌ی حالت‌ها: ردیف هر نماد + ردیف «کل» برای هر حالت."""
+    cmp_df = pd.concat(rows, ignore_index=True)
+    agg_rows = []
+    for mode, g in cmp_df.groupby(mode_col, sort=False):
+        n = float(g["تعداد"].sum())
+        w = g["تعداد"].astype(float)
+        wr = float((g["درصد_برد"] * w).sum() / n) if n > 0 else 0.0
+        ar = float((g["میانگین_R"] * w).sum() / n) if n > 0 else 0.0
+        agg_rows.append({
+            mode_col: mode, "نماد": "کل", "تعداد": int(n),
+            "درصد_برد": round(wr, 2), "میانگین_R": round(ar, 3),
+            "بازده_خالص٪": round(float(g["بازده_خالص٪"].mean()), 2),
+            "حداکثر_افت٪": round(float(g["حداکثر_افت٪"].max()), 2),
+            "فاکتور_سود": round(float(g["فاکتور_سود"].mean()), 3),
+        })
+    out = pd.concat([cmp_df, pd.DataFrame(agg_rows)], ignore_index=True)
+    cols = [mode_col, "نماد", "تعداد", "درصد_برد", "میانگین_R", "بازده_خالص٪", "حداکثر_افت٪", "فاکتور_سود"]
+    out = out[[c for c in cols if c in out.columns]]
+    return out.sort_values([mode_col, "نماد"]).reset_index(drop=True)
+
+def portfolio_replay(trades_df, start_equity=100000.0, reserve=0.15, risk_per_trade=None,
+                     max_open=None, symbols=None, max_losses_day=0, max_losses_week=0,
+                     per_symbol_max_open=0, session_weights=None):
+    """شبیه‌سازی «یک حساب مشترک» روی معاملات همه‌ی نمادها:
+    معامله‌ها به ترتیب زمان ورود اجرا می‌شوند، ریسک هر معامله ۱٪ از اکویتی لحظه‌ای حساب است،
+    و اگر تعداد پوزیشن‌های باز به سقف برسد، معامله‌ی جدید گرفته نمی‌شود (رد می‌شود).
+    منطق استراتژی را تغییر نمی‌دهد؛ فقط حساب را واقعی می‌کند."""
+    import heapq
+
+    if trades_df is None or trades_df.empty:
+        return None
+    t = trades_df.copy()
+    if symbols:
+        t = t[t["نماد"].isin(list(symbols))]
+    if t.empty:
+        return None
+
+    t["زمان_ورود"] = pd.to_datetime(t["زمان_ورود"], errors="coerce")
+    t["زمان_خروج"] = pd.to_datetime(t["زمان_خروج"], errors="coerce")
+    t = t.dropna(subset=["زمان_ورود", "زمان_خروج", "نتیجه_R"]).sort_values("زمان_ورود")
+    if t.empty:
+        return None
+    if max_open is None:
+        max_open = PORTFOLIO_MAX_OPEN
+    open_cap = max_open if (max_open and max_open > 0) else 10**9  # 0 = بدون سقف
+    if risk_per_trade is None:
+        risk_per_trade = PORTFOLIO_RISK_PER_TRADE
+
+    from collections import deque
+
+    eq = float(start_equity); peak = eq; max_dd = 0.0
+    open_heap = []   # (زمان_خروج, ردیف, مبلغ_ریسک, R)
+    curve = []
+    taken = skipped = 0
+    skipped_losslimit = 0
+    skipped_persym = 0
+    win_amt = loss_amt = 0.0
+    rs = []
+    seq = 0
+    loss_times = deque()  # زمان بسته شدن ضررها (برای محدودیت روز/هفته)
+    open_by_sym = {}      # تعداد ترید باز هر نماد (برای سقف هر چارت)
+
+    def close_until(t_now):
+        nonlocal eq, peak, max_dd, win_amt, loss_amt
+        while open_heap and open_heap[0][0] <= t_now:
+            xt, _, ramt, r, sym_ = heapq.heappop(open_heap)
+            open_by_sym[sym_] = max(0, open_by_sym.get(sym_, 0) - 1)
+            pnl = ramt * r
+            eq += pnl
+            if pnl > 0: win_amt += pnl
+            else:
+                loss_amt += -pnl
+                loss_times.append(xt)
+            rs.append(r)
+            peak = max(peak, eq)
+            dd = (peak - eq) / peak if peak > 0 else 0.0
+            max_dd = max(max_dd, dd)
+            curve.append((xt, eq))
+
+    # وزن ریسک هر معامله بر اساس سشنِ ورود (اگر وزن‌دهی فعال باشد)
+    if session_weights is None and USE_DEFAULT_SESSION_WEIGHTS:
+        session_weights = DEFAULT_SESSION_WEIGHTS
+    if session_weights:
+        _sess = ((t["زمان_ورود"].dt.hour + SESSION_HOUR_SHIFT) % 24).apply(hour_to_session)
+        t = t.assign(_w=_sess.map(lambda s: float(session_weights.get(s, 1.0))))
+    else:
+        t = t.assign(_w=1.0)
+
+    for sym, entry_t, exit_t, r, w in zip(t["نماد"], t["زمان_ورود"], t["زمان_خروج"],
+                                          t["نتیجه_R"], t["_w"]):
+        close_until(entry_t)
+        if len(open_heap) >= open_cap:
+            skipped += 1
+            continue
+        # سقف «هر چارت»: مثل ربات لایو، هر نماد هم‌زمان فقط N ترید باز
+        if per_symbol_max_open and open_by_sym.get(sym, 0) >= per_symbol_max_open:
+            skipped_persym += 1
+            continue
+
+        # سپر ایمنی: بعد از N ضرر در روز/هفته، ورود جدید ممنوع تا دوره عوض شود
+        if max_losses_day or max_losses_week:
+            cutoff = entry_t - pd.Timedelta(days=8)
+            while loss_times and loss_times[0] < cutoff:
+                loss_times.popleft()
+            blocked = False
+            if max_losses_day:
+                ld = sum(1 for lt in loss_times if lt.date() == entry_t.date())
+                if ld >= max_losses_day:
+                    blocked = True
+            if not blocked and max_losses_week:
+                iso = entry_t.isocalendar()
+                lw = sum(1 for lt in loss_times
+                         if lt.isocalendar()[0] == iso[0] and lt.isocalendar()[1] == iso[1])
+                if lw >= max_losses_week:
+                    blocked = True
+            if blocked:
+                skipped_losslimit += 1
+                continue
+
+        ramt = eq * (1.0 - reserve) * risk_per_trade * float(w)
+        seq += 1
+        heapq.heappush(open_heap, (exit_t, seq, ramt, float(r), sym))
+        open_by_sym[sym] = open_by_sym.get(sym, 0) + 1
+        taken += 1
+    close_until(pd.Timestamp.max)
+
+    wins = sum(1 for r in rs if r > 0)
+    stats = pd.DataFrame([{
+        "تعداد_نماد": int(t["نماد"].nunique()),
+        "وزن‌دهی_سشن": "فعال (تهاجمی)" if session_weights else "خاموش",
+        "سقف_پوزیشن_همزمان": int(max_open),
+        "ریسک_هر_معامله٪": round(risk_per_trade * 100.0, 2),
+        "معاملات_انجام‌شده": int(taken),
+        "معاملات_ردشده_به_خاطر_سقف": int(skipped),
+        "ردشده_سقف_هر_چارت": int(skipped_persym),
+        "ردشده_محدودیت_ضرر": int(skipped_losslimit),
+        "درصد_برد": round(wins / len(rs) * 100.0, 2) if rs else 0.0,
+        "فاکتور_سود": round(win_amt / loss_amt, 3) if loss_amt > 0 else 999.0,
+        "بازده_خالص٪": round((eq - start_equity) / start_equity * 100.0, 2),
+        "حداکثر_افت٪": round(max_dd * 100.0, 2),
+        "اکویتی_نهایی": round(eq, 2),
+    }])
+
+    curve_df = pd.DataFrame(curve, columns=["زمان", "اکویتی"])
+
+    def _period_returns(fmt):
+        rows = []
+        prev = start_equity
+        c = curve_df.copy()
+        c["دوره"] = c["زمان"].dt.to_period(fmt).astype(str)
+        for per, g in c.groupby("دوره"):
+            e = float(g["اکویتی"].iloc[-1])
+            rows.append({"دوره": per, "بازده٪": round((e - prev) / prev * 100.0, 2),
+                         "اکویتی_پایان": round(e, 2)})
+            prev = e
+        return pd.DataFrame(rows)
+
+    return {"stats": stats,
+            "yearly": _period_returns("Y").rename(columns={"دوره": "سال"}),
+            "monthly": _period_returns("M").rename(columns={"دوره": "ماه"})}
+
+
+def live_book_report(book, trades_df, alloc_df=None):
+    """گزارش حساب در حالت «عین لایو».
+
+    اینجا دیگر هیچ فیلتری روی معاملات اعمال نمی‌شود — سقف‌ها موقع ساخته شدن معامله
+    اعمال شده‌اند، پس این تابع فقط همان حساب واقعی را گزارش می‌کند.
+    """
+    curve_df = pd.DataFrame(book.equity_curve, columns=["زمان", "اکویتی"])
+    rs = trades_df["نتیجه_R"].astype(float) if (trades_df is not None and not trades_df.empty) else pd.Series(dtype=float)
+    wins = int((rs > 0).sum())
+    win_amt = float(rs[rs > 0].sum())
+    loss_amt = float(rs[rs < 0].abs().sum())
+
+    peak_pending = int(alloc_df["سفارش_تخصیص‌یافته"].max()) if (alloc_df is not None and not alloc_df.empty) else 0
+    avg_pending = round(float(alloc_df["سفارش_تخصیص‌یافته"].mean()), 2) if (alloc_df is not None and not alloc_df.empty) else 0.0
+    peak_open = int(alloc_df["پوزیشن_باز"].max()) if (alloc_df is not None and not alloc_df.empty) else 0
+
+    stats = pd.DataFrame([{
+        "حالت": "عین لایو (همه‌ی نمادها هم‌زمان روی یک حساب)",
+        "تعداد_نماد": int(trades_df["نماد"].nunique()) if (trades_df is not None and not trades_df.empty) else 0,
+        "وزن‌دهی_سشن": "فعال" if book.session_weights else "خاموش",
+        "سقف_سفارش_کل_حساب": int(LIVE_MAX_PENDING_TOTAL),
+        "سقف_پوزیشن_کل_حساب": int(book.max_open_total),
+        "سقف_سفارش_هر_نماد": int(LIVE_MAX_PENDING_PER_SYMBOL),
+        "ریسک_هر_معامله٪": round(book.risk_per_trade * 100.0, 2),
+        "معاملات_انجام‌شده": int(len(rs)),
+        "درصد_برد": round(wins / len(rs) * 100.0, 2) if len(rs) else 0.0,
+        "فاکتور_سود": round(win_amt / loss_amt, 3) if loss_amt > 0 else 999.0,
+        "بازده_خالص٪": round((book.equity - book.start_equity) / book.start_equity * 100.0, 2),
+        "حداکثر_افت٪": round(book.max_dd * 100.0, 2),
+        "اکویتی_نهایی": round(book.equity, 2),
+        "بیشترین_سفارش_همزمان": peak_pending,
+        "میانگین_سفارش_همزمان": avg_pending,
+        "بیشترین_پوزیشن_همزمان": peak_open,
+    }])
+
+    def _period_returns(fmt):
+        rows = []
+        prev = book.start_equity
+        if curve_df.empty:
+            return pd.DataFrame(rows)
+        c = curve_df.copy()
+        c["زمان"] = pd.to_datetime(c["زمان"], errors="coerce")
+        c["دوره"] = c["زمان"].dt.to_period(fmt).astype(str)
+        for per, g in c.groupby("دوره"):
+            e = float(g["اکویتی"].iloc[-1])
+            rows.append({"دوره": per, "بازده٪": round((e - prev) / prev * 100.0, 2),
+                         "اکویتی_پایان": round(e, 2)})
+            prev = e
+        return pd.DataFrame(rows)
+
+    return {"stats": stats,
+            "yearly": _period_returns("Y").rename(columns={"دوره": "سال"}),
+            "monthly": _period_returns("M").rename(columns={"دوره": "ماه"})}
+
+
+def stability_split_test(trades_df, min_trades=None):
+    """تست پایداری: کارنامه‌ی هر نماد در نیمه‌ی اول در برابر نیمه‌ی دوم بازه.
+
+    چرا مهم است؟ نمادی که کل سودش از یک دوره‌ی خوش‌شانس آمده، در نیمه‌ی دیگر
+    ضررده است. چنین نمادی لبه‌ی واقعی ندارد و اعتماد به آن یعنی برازش به گذشته.
+
+    فقط از «میانگین R» و «فاکتور سود» قضاوت می‌کنیم چون مستقل از اندازه‌ی حساب‌اند
+    (سود دلاری با بزرگ شدن حساب رشد می‌کند و نیمه‌ی دوم را الکی برنده نشان می‌دهد).
+    """
+    if trades_df is None or trades_df.empty:
+        return None
+    min_trades = STABILITY_MIN_TRADES if min_trades is None else min_trades
+
+    t = trades_df.copy()
+    t["زمان_ورود"] = pd.to_datetime(t["زمان_ورود"], errors="coerce")
+    t = t.dropna(subset=["زمان_ورود"])
+    if t.empty:
+        return None
+
+    t0, t1 = t["زمان_ورود"].min(), t["زمان_ورود"].max()
+    mid = t0 + (t1 - t0) / 2
+
+    def half_stats(g):
+        if g.empty:
+            return dict(تعداد=0, درصد_برد=0.0, میانگین_R=0.0, فاکتور_سود=0.0, جمع_R=0.0)
+        r = g["نتیجه_R"].astype(float)
+        win = float(r[r > 0].sum())
+        los = float(r[r < 0].abs().sum())
+        return dict(تعداد=int(len(r)),
+                    درصد_برد=round(float((r > 0).mean() * 100.0), 2),
+                    میانگین_R=round(float(r.mean()), 3),
+                    فاکتور_سود=round(win / los, 3) if los > 0 else 999.0,
+                    جمع_R=round(float(r.sum()), 2))
+
+    rows = []
+    for sym, g in t.groupby("نماد"):
+        a = half_stats(g[g["زمان_ورود"] < mid])
+        b = half_stats(g[g["زمان_ورود"] >= mid])
+
+        if a["تعداد"] < min_trades or b["تعداد"] < min_trades:
+            verdict = "نمونه‌ی کم — قضاوت نکن"
+        elif a["میانگین_R"] > 0 and b["میانگین_R"] > 0:
+            verdict = "پایدار ✅"
+        elif a["میانگین_R"] <= 0 and b["میانگین_R"] <= 0:
+            verdict = "در هر دو نیمه ضررده ❌"
+        elif b["میانگین_R"] > 0:
+            verdict = "فقط نیمه‌ی دوم خوب بود ⚠️"
+        else:
+            verdict = "فقط نیمه‌ی اول خوب بود ⚠️"
+
+        rows.append({
+            "نماد": sym,
+            "نیمه۱_تعداد": a["تعداد"], "نیمه۱_برد٪": a["درصد_برد"],
+            "نیمه۱_میانگین_R": a["میانگین_R"], "نیمه۱_فاکتور_سود": a["فاکتور_سود"],
+            "نیمه۲_تعداد": b["تعداد"], "نیمه۲_برد٪": b["درصد_برد"],
+            "نیمه۲_میانگین_R": b["میانگین_R"], "نیمه۲_فاکتور_سود": b["فاکتور_سود"],
+            "اختلاف_میانگین_R": round(b["میانگین_R"] - a["میانگین_R"], 3),
+            "حکم": verdict,
+        })
+
+    out = pd.DataFrame(rows).sort_values("نیمه۲_میانگین_R", ascending=False)
+    out.insert(0, "مرز_دو_نیمه", mid.strftime("%Y-%m-%d"))
+    return out.reset_index(drop=True)
+
+
+def leave_one_out_test(frames, spreads, **kw):
+    """تست حذف تک‌نماد: حساب بدون هر نماد چقدر بهتر/بدتر می‌شود؟
+
+    چون نمادها سر ۸ جای سفارش با هم رقابت می‌کنند، حذف یک نماد فقط معاملاتش را
+    کم نمی‌کند — جای خالی‌اش به بقیه می‌رسد. پس تنها راه درست این است که کل
+    بک‌تست بدون آن نماد دوباره اجرا شود.
+    """
+    def run(fr, label):
+        _res, bk, _al = portfolio_live_replay(fr, spreads, **kw)
+        tr = [r[2] for r in _res.values() if r[2] is not None and not r[2].empty]
+        n = int(sum(len(x) for x in tr))
+        return {"حالت": label,
+                "بازده٪": round((bk.equity / bk.start_equity - 1.0) * 100.0, 2),
+                "حداکثر_افت٪": round(bk.max_dd * 100.0, 2),
+                "تعداد_معامله": n}
+
+    print("   [۰/%d] سبد کامل..." % len(frames))
+    base = run(frames, "سبد کامل (مبنا)")
+    rows = [base]
+
+    for i, sym in enumerate(list(frames.keys()), start=1):
+        print(f"   [{i}/{len(frames)}] بدون {sym}...")
+        sub = {k: v for k, v in frames.items() if k != sym}
+        if not sub:
+            continue
+        r = run(sub, f"بدون {sym}")
+        r["Δبازده٪"] = round(r["بازده٪"] - base["بازده٪"], 2)
+        r["Δافت٪"] = round(r["حداکثر_افت٪"] - base["حداکثر_افت٪"], 2)
+        # بهتر = هم بازده بالاتر هم افت کمتر (یا یکی خیلی بهتر و دیگری بدتر نشده)
+        if r["Δبازده٪"] > 0 and r["Δافت٪"] <= 0:
+            r["حکم"] = "حذفش حساب را بهتر می‌کند ✅"
+        elif r["Δبازده٪"] < 0 and r["Δافت٪"] >= 0:
+            r["حکم"] = "حذفش حساب را بدتر می‌کند ❌"
+        else:
+            r["حکم"] = "مبادله (یکی بهتر، یکی بدتر) ⚖️"
+        rows.append(r)
+
+    out = pd.DataFrame(rows)
+    cols = ["حالت", "تعداد_معامله", "بازده٪", "Δبازده٪", "حداکثر_افت٪", "Δافت٪", "حکم"]
+    return out[[c for c in cols if c in out.columns]]
+
+
+def main():
+    version_name = os.path.basename(os.getcwd())
+    outdir = os.path.join(os.getcwd(), "خروجی")
+    os.makedirs(outdir, exist_ok=True)
+
+    years = None  # از 2023 تا پایان داده، به‌صورت پویا محاسبه می‌شود
+
+    # Spread estimates (edit if needed)
+    spreads = {
+        "EURUSD":0.00012, "GBPUSD":0.00018, "AUDUSD":0.00014, "NZDUSD":0.00016,
+        "USDCAD":0.00015, "USDCHF":0.00014,
+        "EURAUD":0.00025, "EURCAD":0.00022, "EURGBP":0.00018, "EURNZD":0.00025,
+        "GBPAUD":0.00030, "GBPCAD":0.00028, "GBPNZD":0.00032,
+        "AUDCAD":0.00022, "AUDNZD":0.00024, "CADJPY":0.020, "CHFJPY":0.020,
+        "EURJPY":0.020, "GBPJPY":0.025, "USDJPY":0.020, "AUDJPY":0.020,
+        "NZDCAD":0.00025, "NZDUSD":0.00016,
+        "XAUUSD":0.30, "XAGUSD":0.03
+    }
+
+    changes = [
+        "نماد EURUSD به‌دلیل دراودان بالا حذف شد و نماد GBPJPY اضافه شد.",
+        "خروجی‌ها محدود شد: فقط تنظیمات_بکتست.json، ژورنال.txt، ژورنال_این_ورژن.pdf، نتایج_اعدادی.xlsx",
+        "نتایج_اعدادی.xlsx شامل ستون‌های مقایسه با نسخه قبلی (اگر پیدا شود) است."
+    ]
+    upgrades = [
+        "گزارش زون‌محور: برای هر زون فقط یک نتیجه نهایی (FinalStatus/FinalReason)",
+        "گزارش رویدادها: Touch1/Touch2/ثبت سفارش/لغو/پر شدن/خروج با زمان دقیق",
+        "دلایل حذف برحسب زون با درصد واقعی (نه شمارش رویداد تکراری)",
+        "خروجی‌ها محدود شد: فقط نتایج_اعدادی.xlsx + ژورنال (txt/pdf) + تنظیمات_بکتست.json"
+    ]
+
+    q_answers = {
+        "چرا تغییری ایجاد کردم؟": "برای اینکه اندازه‌گیری علمی و قابل اعتماد شود؛ اول اندازه‌گیری را دقیق می‌کنیم، بعد تصمیم روی قوانین می‌گیریم.",
+        "انتظارم چی بود؟": "اینکه بفهمیم دقیقاً از کل زون‌ها چند درصد در هر مرحله حذف می‌شوند و گلوگاه اصلی کجاست.",
+        "چه نتیجه‌ای رخ داد؟": "در فایل نتایج_اعدادی.xlsx ستون «نتیجه_تغییر» و ستون‌های Δ (اختلاف) نشان می‌دهد حذف EURUSD و اضافه شدن GBPJPY نسبت به نسخه قبلی بهتر/بدتر شده است. اگر نسخه قبلی پیدا نشود، در همان فایل درج می‌شود: Baseline یافت نشد.",
+        "چه تغییری ایجاد کردم؟": "نماد EURUSD به‌دلیل دراودان بالا حذف شد و نماد GBPJPY اضافه شد."
+    }
+
+    # DATA DIR: folder '0' on Desktop (your screenshot)
+    datadir = os.path.join(os.path.expandvars(r"%USERPROFILE%"), "Desktop", "0")
+
+    zip_files = sorted(glob.glob(os.path.join(datadir, "*.zip")))
+    if not zip_files:
+        raise FileNotFoundError(f"هیچ فایل ZIP در مسیر دیتا پیدا نشد: {datadir}")
+
+    all_metrics=[]
+    all_reasons=[]
+    all_trades=[]
+    all_zones=[]
+    all_events=[]
+    all_zone_reasons=[]
+    entry_mode_rows=[]
+    rr_mode_rows=[]
+    minrisk_mode_rows=[]
+    distcancel_mode_rows=[]
+    manage_mode_rows=[]
+    sl_mode_rows=[]
+    quality_mode_rows=[]
+    max_data_time = None
+
+    # --- همه‌ی دیتاها یک‌جا خوانده می‌شود (در حالت «عین لایو» همه با هم لازم‌اند) ---
+    frames = {}
+    for zp in zip_files:
+        symbol = os.path.basename(zp).split(".")[0]  # e.g. USDJPY.W.D.H4.zip => USDJPY
+        h4, d1, w1, m15 = load_timeframes_from_zip(zp)
+        if m15 is None and USE_M15:
+            print(f"⚠️ {symbol}: فایل M15 داخل ZIP نیست؛ ابهام‌های داخل کندل بدبینانه (استاپ) حساب می‌شود.")
+        if not h4.empty:
+            end_t = pd.to_datetime(h4["time"].max(), errors="coerce")
+            if pd.notna(end_t):
+                max_data_time = end_t if max_data_time is None else max(max_data_time, end_t)
+        frames[symbol] = (h4, d1, w1, m15)
+
+    live_results = None
+    live_book = None
+    live_alloc = None
+    if LIVE_MODE:
+        print(f"\n🔗 حالت «عین لایو»: {len(frames)} نماد هم‌زمان روی یک حساب | "
+              f"سقف {LIVE_MAX_PENDING_TOTAL} سفارش و {LIVE_MAX_OPEN_TOTAL} پوزیشن در کل حساب، "
+              f"هر نماد حداکثر {LIVE_MAX_PENDING_PER_SYMBOL} سفارش")
+        live_results, live_book, live_alloc = portfolio_live_replay(
+            frames, spreads, entry_off=DEFAULT_ENTRY_OFF, sl_off=DEFAULT_SL_OFF,
+            rr=DEFAULT_RR, manage_mode=DEFAULT_MANAGE, min_risk_atr=DEFAULT_MIN_RISK_ATR)
+        print(f"   اکویتی پایانی: {live_book.equity:,.0f} | "
+              f"بازده {(live_book.equity/live_book.start_equity-1)*100:.2f}٪ | "
+              f"حداکثر افت {live_book.max_dd*100:.2f}٪")
+
+    for symbol, (h4, d1, w1, m15) in frames.items():
+        if LIVE_MODE:
+            res = live_results.get(symbol)
+            if res is None:
+                continue
+            mdf, rdf, tdf, zdf, edf, zreason = res
+        else:
+            mdf, rdf, tdf, zdf, edf, zreason = backtest_one(symbol, h4,d1,w1, years, spreads.get(symbol, 0.0),
+                                                            entry_off=DEFAULT_ENTRY_OFF, sl_off=DEFAULT_SL_OFF,
+                                                            rr=DEFAULT_RR, m15=m15,
+                                                            min_risk_atr=DEFAULT_MIN_RISK_ATR,
+                                                            manage_mode=DEFAULT_MANAGE)
+
+        # مقایسه‌ی فیلترهای کیفیت زون (Odds Enhancers)
+        if COMPARE_QUALITY_MODES:
+            for mode_name, kw in QUALITY_MODES.items():
+                if not kw:
+                    m_q = mdf.copy()
+                else:
+                    m_q = backtest_one(symbol, h4, d1, w1, years, spreads.get(symbol, 0.0),
+                                       entry_off=DEFAULT_ENTRY_OFF, sl_off=DEFAULT_SL_OFF,
+                                       rr=DEFAULT_RR, m15=m15, manage_mode=DEFAULT_MANAGE,
+                                       **kw)[0].copy()
+                m_q["کیفیت_زون"] = mode_name
+                quality_mode_rows.append(m_q)
+
+        # مقایسه‌ی فاصله‌ی حد ضرر (۲۵٪ در برابر ۵۰٪ پشت دیستال)
+        if COMPARE_SL_MODES:
+            for mode_name, so in SL_MODES.items():
+                if abs(so - DEFAULT_SL_OFF) < 1e-12:
+                    m_sl = mdf.copy()
+                else:
+                    m_sl = backtest_one(symbol, h4, d1, w1, years, spreads.get(symbol, 0.0),
+                                        entry_off=DEFAULT_ENTRY_OFF, sl_off=so, rr=DEFAULT_RR,
+                                        m15=m15, manage_mode=DEFAULT_MANAGE)[0].copy()
+                m_sl["حالت_استاپ"] = mode_name
+                sl_mode_rows.append(m_sl)
+
+        # مقایسه‌ی حالت‌های مدیریت معامله (سیو سود / ریسک‌فری)
+        if COMPARE_MANAGE_MODES:
+            for mode_name, mm in MANAGE_MODES.items():
+                if mm == DEFAULT_MANAGE:
+                    m_mm = mdf.copy()
+                else:
+                    m_mm = backtest_one(symbol, h4, d1, w1, years, spreads.get(symbol, 0.0),
+                                        entry_off=DEFAULT_ENTRY_OFF, rr=DEFAULT_RR, m15=m15,
+                                        manage_mode=mm)[0].copy()
+                m_mm["مدیریت"] = mode_name
+                manage_mode_rows.append(m_mm)
+
+        # اجرای RR های دیگر فقط برای مقایسه (گزارش‌های کامل با DEFAULT_RR است)
+        if COMPARE_RR_MODES:
+            for mode_name, rrv in RR_MODES.items():
+                if abs(rrv - DEFAULT_RR) < 1e-12:
+                    m_rr = mdf.copy()
+                else:
+                    m_rr = backtest_one(symbol, h4, d1, w1, years, spreads.get(symbol, 0.0),
+                                        entry_off=DEFAULT_ENTRY_OFF, rr=rrv, m15=m15)[0].copy()
+                m_rr["حالت_RR"] = mode_name
+                rr_mode_rows.append(m_rr)
+
+        # مقایسه‌ی آستانه‌های «لغو در صورت دور شدن قیمت»
+        if COMPARE_DISTCANCEL_MODES:
+            for mode_name, dcr in DISTCANCEL_MODES.items():
+                if abs(dcr - DEFAULT_DIST_CANCEL_R) < 1e-12:
+                    m_dc = mdf.copy()
+                else:
+                    m_dc = backtest_one(symbol, h4, d1, w1, years, spreads.get(symbol, 0.0),
+                                        entry_off=DEFAULT_ENTRY_OFF, rr=DEFAULT_RR, m15=m15,
+                                        dist_cancel_r=dcr)[0].copy()
+                m_dc["قانون_لغو_دور"] = mode_name
+                distcancel_mode_rows.append(m_dc)
+
+        # مقایسه‌ی آستانه‌های فیلتر «حداقل اندازه‌ی زون»
+        if COMPARE_MINRISK_MODES:
+            for mode_name, mra in MINRISK_MODES.items():
+                if abs(mra - DEFAULT_MIN_RISK_ATR) < 1e-12:
+                    m_mr = mdf.copy()
+                else:
+                    m_mr = backtest_one(symbol, h4, d1, w1, years, spreads.get(symbol, 0.0),
+                                        entry_off=DEFAULT_ENTRY_OFF, rr=DEFAULT_RR, m15=m15,
+                                        min_risk_atr=mra)[0].copy()
+                m_mr["حداقل_زون"] = mode_name
+                minrisk_mode_rows.append(m_mr)
+
+        # اجرای حالت‌های دیگر نقطه‌ی ورود فقط برای مقایسه (بقیه‌ی گزارش‌ها با حالت اصلی است)
+        if COMPARE_ENTRY_MODES:
+            for mode_name, eoff in ENTRY_MODES.items():
+                if abs(eoff - DEFAULT_ENTRY_OFF) < 1e-12:
+                    m_mode = mdf.copy()
+                else:
+                    m_mode = backtest_one(symbol, h4, d1, w1, years, spreads.get(symbol, 0.0),
+                                          entry_off=eoff, m15=m15)[0].copy()
+                m_mode["حالت_ورود"] = mode_name
+                entry_mode_rows.append(m_mode)
+
+        all_metrics.append(mdf)
+        all_reasons.append(rdf)
+        all_trades.append(tdf)
+        all_zones.append(zdf)
+        all_events.append(edf)
+        all_zone_reasons.append(zreason)
+        # (خروجی معاملات_*.csv غیرفعال شد: طبق درخواست فقط ۴ فایل خروجی)
+
+    metrics_df=pd.concat(all_metrics, ignore_index=True)
+    reasons_df=pd.concat(all_reasons, ignore_index=True)
+    trades_df=pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+    zones_df=pd.concat(all_zones, ignore_index=True)
+    events_df=pd.concat(all_events, ignore_index=True)
+    zone_reasons_df=pd.concat(all_zone_reasons, ignore_index=True)
+
+    # مدت واقعی بک‌تست: از شروع 2023 تا انتهای دیتای موجود
+    if max_data_time is not None:
+        end_t = max_data_time if BACKTEST_END is None else min(max_data_time, BACKTEST_END)
+        years = max((end_t - BACKTEST_START).days / 365.25, 1.0 / 12.0)
+    else:
+        years = 1.0 / 12.0
+
+    # --- Review change impact (compares with previous version if available) ---
+    metrics_df, baseline_path = augment_metrics_with_change_review(metrics_df, os.getcwd(), years,
+                                                                   book=live_book)
+
+    
+    # --- خروجی‌ها: فقط دو فایل در پوشه «خروجی» ---
+    # 1) فایل خلاصه
+    summary_path = os.path.join(outdir, "خلاصه_نتایج.xlsx")
+    # 2) فایل جزئیات حرفه‌ای
+    detailed_path = os.path.join(outdir, "جزئیات_حرفه‌ای.xlsx")
+
+    try:
+
+        # آماده‌سازی زمان‌ها
+        if not trades_df.empty:
+            for c in ["زمان_ورود", "زمان_خروج"]:
+                if c in trades_df.columns:
+                    trades_df[c] = pd.to_datetime(trades_df[c], errors="coerce")
+
+        # --- جداول پایه ---
+        # خلاصه‌ی نمادها (همان نتایج اعدادی)
+        sym_metrics = metrics_df.copy()
+
+        # خلاصه کلی (پورتفوی تقریب وزن‌مساوی روی نمادها)
+        _m = sym_metrics[sym_metrics["نماد"] != "کل"].copy() if "کل" in sym_metrics.get("نماد", pd.Series()).astype(str).values else sym_metrics.copy()
+        overview = {}
+        overview["نسخه"] = version_name
+        overview["years"] = round(float(years), 4)
+        overview["datadir"] = datadir
+        overview["ReserveCapitalPercent"] = 15
+        overview["RiskPerTradePercent"] = 1
+        overview["MaxOrders"] = 3
+        overview["EntryOffsetPct"] = 10
+        overview["StopOffsetPct"] = 25
+        overview["RR"] = 3
+        overview["SymbolsCount"] = int(len(_m))
+        overview["TotalTrades"] = int(_m["تعداد"].fillna(0).sum()) if "تعداد" in _m.columns else (int(len(trades_df)) if not trades_df.empty else 0)
+        overview["AvgWinRatePct"] = float(_m["درصد_برد"].mean()) if "درصد_برد" in _m.columns else np.nan
+        overview["AvgProfitFactor"] = float(_m["فاکتور_سود"].mean()) if "فاکتور_سود" in _m.columns else np.nan
+        overview["AvgNetReturnPct"] = float(_m["بازده_خالص٪"].mean()) if "بازده_خالص٪" in _m.columns else np.nan
+        overview["MedianNetReturnPct"] = float(_m["بازده_خالص٪"].median()) if "بازده_خالص٪" in _m.columns else np.nan
+        overview["AvgMaxDrawdownPct"] = float(_m["حداکثر_افت٪"].mean()) if "حداکثر_افت٪" in _m.columns else np.nan
+
+        # بهترین/بدترین نماد بر اساس بازده
+        if "بازده_خالص٪" in _m.columns and "نماد" in _m.columns and len(_m) > 0:
+            best_row = _m.sort_values("بازده_خالص٪", ascending=False).iloc[0]
+            worst_row = _m.sort_values("بازده_خالص٪", ascending=True).iloc[0]
+            overview["BestSymbol"] = str(best_row["نماد"])
+            overview["BestNetReturnPct"] = float(best_row["بازده_خالص٪"])
+            overview["WorstSymbol"] = str(worst_row["نماد"])
+            overview["WorstNetReturnPct"] = float(worst_row["بازده_خالص٪"])
+        else:
+            overview["BestSymbol"] = ""
+            overview["BestNetReturnPct"] = np.nan
+            overview["WorstSymbol"] = ""
+            overview["WorstNetReturnPct"] = np.nan
+
+        overview_df = pd.DataFrame([overview])
+
+        # --- معاملات: تست 1/2، شمارش‌ها ---
+        if trades_df.empty:
+            test_counts = pd.DataFrame(columns=["تست", "تعداد"])
+            trades_by_symbol = pd.DataFrame(columns=["نماد", "تعداد"])
+            trades_by_year_symbol = pd.DataFrame(columns=["نماد", "سال", "تعداد"])
+        else:
+            test_counts = trades_df.groupby("تست").size().reset_index(name="تعداد").sort_values("تست")
+            trades_by_symbol = trades_df.groupby("نماد").size().reset_index(name="تعداد").sort_values("تعداد", ascending=False)
+            trades_df["سال"] = trades_df["زمان_خروج"].dt.year.fillna(trades_df["زمان_ورود"].dt.year)
+            trades_by_year_symbol = trades_df.groupby(["نماد", "سال"]).size().reset_index(name="تعداد").sort_values(["نماد", "سال"])
+
+        # --- زون‌ها: تعداد ساخته‌شده/تریدشده ---
+        if zones_df.empty:
+            zone_stats = pd.DataFrame(columns=["نماد", "TotalZonesBuilt", "UniqueZonesTraded"])
+        else:
+            built = zones_df.groupby("نماد").size().reset_index(name="TotalZonesBuilt")
+            traded = (trades_df.groupby("نماد")["ZoneID"].nunique().reset_index(name="UniqueZonesTraded")
+                      if (not trades_df.empty and "ZoneID" in trades_df.columns) else
+                      pd.DataFrame({"نماد": built["نماد"], "UniqueZonesTraded": 0}))
+            zone_stats = built.merge(traded, on="نماد", how="left").fillna(0).sort_values("TotalZonesBuilt", ascending=False)
+
+        # --- بازده سالانه/ماهانه برای هر نماد (با بازسازی اکویتی همان فرمول کد) ---
+        def _equity_series_for_symbol(sym_trades: pd.DataFrame, reserve=0.15, risk_per_trade=0.01, start_equity=100000.0):
+            if sym_trades.empty:
+                return pd.DataFrame(columns=["زمان", "اکویتی"])
+            t = sym_trades.copy()
+            # ترتیب بر اساس زمان خروج
+            t = t.sort_values("زمان_خروج")
+            eq = start_equity
+            rows = []
+            for _, r in t.iterrows():
+                res_r = float(r.get("نتیجه_R", 0.0))
+                usable = eq * (1.0 - reserve)
+                risk_amt = usable * risk_per_trade
+                eq = eq + risk_amt * res_r
+                rows.append({"زمان": r["زمان_خروج"], "اکویتی": eq})
+            return pd.DataFrame(rows)
+
+        annual_rows=[]
+        monthly_rows=[]
+        avg_rows=[]
+        if not trades_df.empty:
+            for sym, g in trades_df.groupby("نماد"):
+                es = _equity_series_for_symbol(g, reserve=0.15, risk_per_trade=0.01, start_equity=100000.0)
+                if es.empty:
+                    continue
+                es = es.dropna(subset=["زمان"])
+                if es.empty:
+                    continue
+                es = es.sort_values("زمان")
+                es["سال"] = es["زمان"].dt.year
+                es["ماه"] = es["زمان"].dt.to_period("M").astype(str)
+
+                # سالانه
+                for y, gy in es.groupby("سال"):
+                    eq_end = float(gy["اکویتی"].iloc[-1])
+                    # equity start = last equity before this year, or 100000 if first year
+                    prev = es[es["زمان"].dt.year < y]
+                    eq_start = float(prev["اکویتی"].iloc[-1]) if not prev.empty else 100000.0
+                    ret = (eq_end - eq_start) / eq_start * 100.0 if eq_start != 0 else 0.0
+                    annual_rows.append({"نماد": sym, "سال": int(y), "بازده_سالانه٪": round(ret, 2), "اکویتی_شروع": round(eq_start, 2), "اکویتی_پایان": round(eq_end, 2)})
+
+                # ماهانه
+                for mth, gm in es.groupby("ماه"):
+                    eq_end = float(gm["اکویتی"].iloc[-1])
+                    # equity start = last equity before this month, or 100000 if first month
+                    prev = es[es["زمان"] < pd.to_datetime(mth + "-01")]
+                    eq_start = float(prev["اکویتی"].iloc[-1]) if not prev.empty else 100000.0
+                    ret = (eq_end - eq_start) / eq_start * 100.0 if eq_start != 0 else 0.0
+                    monthly_rows.append({"نماد": sym, "ماه": mth, "بازده_ماهانه٪": round(ret, 2), "اکویتی_شروع": round(eq_start, 2), "اکویتی_پایان": round(eq_end, 2)})
+
+        annual_df = pd.DataFrame(annual_rows).sort_values(["نماد","سال"]) if annual_rows else pd.DataFrame(columns=["نماد","سال","بازده_سالانه٪","اکویتی_شروع","اکویتی_پایان"])
+        monthly_df = pd.DataFrame(monthly_rows).sort_values(["نماد","ماه"]) if monthly_rows else pd.DataFrame(columns=["نماد","ماه","بازده_ماهانه٪","اکویتی_شروع","اکویتی_پایان"])
+
+        # میانگین‌ها (سالانه/ماهانه برای هر نماد)
+        if not annual_df.empty:
+            a = annual_df.groupby("نماد")["بازده_سالانه٪"].mean().reset_index(name="میانگین_بازده_سالانه٪")
+        else:
+            a = pd.DataFrame(columns=["نماد","میانگین_بازده_سالانه٪"])
+        if not monthly_df.empty:
+            m = monthly_df.groupby("نماد")["بازده_ماهانه٪"].mean().reset_index(name="میانگین_بازده_ماهانه٪")
+        else:
+            m = pd.DataFrame(columns=["نماد","میانگین_بازده_ماهانه٪"])
+        avg_df = a.merge(m, on="نماد", how="outer").sort_values("نماد")
+
+        # --- دلایل (از reasons_df) ---
+        reasons_out = reasons_df.copy() if not reasons_df.empty else pd.DataFrame(columns=["نماد","دلیل","تعداد"])
+
+        # --- تحلیل حرفه‌ای توزیع/زمان معاملات (فقط اگر فایل جزئیات خواسته شده) ---
+        dist_sheets = distribution_sheets(trades_df) if WRITE_DETAILS else {}
+
+        # --- فایل خلاصه (فقط شاخص‌های کلیدی درخواستی) ---
+        summary_df = metrics_df.copy()
+        if "درصد_برد" in summary_df.columns:
+            summary_df["درصد_لاس"] = 100.0 - pd.to_numeric(summary_df["درصد_برد"], errors="coerce").fillna(0.0)
+        else:
+            summary_df["درصد_لاس"] = np.nan
+
+        # فقط شاخص‌های کلیدی — خروجی تمیز و خوانا
+        summary_cols = [
+            "نماد", "تعداد", "درصد_برد", "فاکتور_سود", "میانگین_R", "بازده_خالص٪", "حداکثر_افت٪"
+        ]
+        for c in summary_cols:
+            if c not in summary_df.columns:
+                summary_df[c] = np.nan
+        summary_out = summary_df[summary_cols].copy()
+
+        # --- شیت‌های مقایسه (نقطه‌ی ورود / RR) ---
+        cmp_out = _aggregate_mode_rows(entry_mode_rows, "حالت_ورود") if (COMPARE_ENTRY_MODES and entry_mode_rows) else None
+        rr_out = _aggregate_mode_rows(rr_mode_rows, "حالت_RR") if (COMPARE_RR_MODES and rr_mode_rows) else None
+        mr_out = _aggregate_mode_rows(minrisk_mode_rows, "حداقل_زون") if (COMPARE_MINRISK_MODES and minrisk_mode_rows) else None
+        dc_out = _aggregate_mode_rows(distcancel_mode_rows, "قانون_لغو_دور") if (COMPARE_DISTCANCEL_MODES and distcancel_mode_rows) else None
+        mg_out = _aggregate_mode_rows(manage_mode_rows, "مدیریت") if (COMPARE_MANAGE_MODES and manage_mode_rows) else None
+        sl_out = _aggregate_mode_rows(sl_mode_rows, "حالت_استاپ") if (COMPARE_SL_MODES and sl_mode_rows) else None
+        q_out = _aggregate_mode_rows(quality_mode_rows, "کیفیت_زون") if (COMPARE_QUALITY_MODES and quality_mode_rows) else None
+
+        # --- تحلیل سشن‌های معاملاتی ---
+        sess_out = hour_out = sesssym_out = None
+        if ANALYZE_SESSIONS:
+            try:
+                sess_out, hour_out, sesssym_out = session_analysis(trades_df)
+            except Exception as e:
+                print("⚠️ تحلیل سشن ناموفق بود:", str(e))
+
+        # --- شبیه‌سازی حساب مشترک (پرتفوی) ---
+        # --- تست پایداری نمادها (نیمه‌ی اول در برابر نیمه‌ی دوم) ---
+        stab_out = None
+        if STABILITY_TEST:
+            try:
+                stab_out = stability_split_test(trades_df)
+                if stab_out is not None:
+                    bad = stab_out[stab_out["حکم"].str.contains("ضررده|فقط نیمه", na=False)]
+                    print(f"🧪 تست پایداری: {len(stab_out)} نماد بررسی شد | "
+                          f"{len(bad)} نماد لبه‌ی ناپایدار دارد (شیت «پایداری_نماد»)")
+            except Exception as e:
+                print("⚠️ تست پایداری ناموفق بود:", str(e))
+
+        # --- تست حذف تک‌نماد (زمان‌بر) ---
+        loo_out = None
+        if LEAVE_ONE_OUT_TEST and LIVE_MODE:
+            try:
+                print(f"\n🧪 تست حذف تک‌نماد: {len(frames)+1} اجرای کامل — این چند ده دقیقه طول می‌کشد...")
+                loo_out = leave_one_out_test(
+                    frames, spreads, entry_off=DEFAULT_ENTRY_OFF, sl_off=DEFAULT_SL_OFF,
+                    rr=DEFAULT_RR, manage_mode=DEFAULT_MANAGE, min_risk_atr=DEFAULT_MIN_RISK_ATR)
+                print("   تمام شد (شیت «حذف_تک‌نماد»)")
+            except Exception as e:
+                print("⚠️ تست حذف تک‌نماد ناموفق بود:", str(e))
+
+        port = None
+        try:
+            if LIVE_MODE and live_book is not None:
+                # سقف‌ها همان موقع ساخته شدن معامله اعمال شده‌اند — دوباره فیلتر نمی‌کنیم
+                port = live_book_report(live_book, trades_df, live_alloc)
+            else:
+                port = portfolio_replay(trades_df, symbols=(PORTFOLIO_SYMBOLS or None))
+        except Exception as e:
+            print("⚠️ شبیه‌سازی پرتفوی ناموفق بود:", str(e))
+
+        # --- مقایسه‌ی وزن‌دهی ریسک بر اساس سشن ---
+        sw_out = None
+        if COMPARE_SESSION_WEIGHTS:
+            try:
+                sw_rows = []
+                for label, weights in SESSION_WEIGHT_MODES.items():
+                    pr = portfolio_replay(trades_df, symbols=(PORTFOLIO_SYMBOLS or None),
+                                          session_weights=(weights or None))
+                    if pr is None:
+                        continue
+                    s = pr["stats"].copy()
+                    s.insert(0, "وزن‌دهی", label)
+                    m = pr["monthly"]
+                    s["بدترین_ماه٪"] = round(float(m["بازده٪"].min()), 2) if not m.empty else 0.0
+                    s["ماه‌های_منفی"] = int((m["بازده٪"] < 0).sum()) if not m.empty else 0
+                    sw_rows.append(s)
+                if sw_rows:
+                    sw_out = pd.concat(sw_rows, ignore_index=True)
+            except Exception as e:
+                print("⚠️ مقایسه‌ی وزن سشن ناموفق بود:", str(e))
+
+        # --- مقایسه‌ی «سقف اجرا» (شبیه ربات لایو) روی همان حساب مشترک ---
+        ec_out = None
+        if COMPARE_EXECCAP_MODES:
+            try:
+                ec_rows = []
+                for label, (mo, ps) in EXECCAP_MODES.items():
+                    pr = portfolio_replay(trades_df, symbols=(PORTFOLIO_SYMBOLS or None),
+                                          max_open=mo, per_symbol_max_open=ps)
+                    if pr is None:
+                        continue
+                    s = pr["stats"].copy()
+                    s.insert(0, "سقف_اجرا", label)
+                    m = pr["monthly"]
+                    s["بدترین_ماه٪"] = round(float(m["بازده٪"].min()), 2) if not m.empty else 0.0
+                    s["ماه‌های_منفی"] = int((m["بازده٪"] < 0).sum()) if not m.empty else 0
+                    ec_rows.append(s)
+                if ec_rows:
+                    ec_out = pd.concat(ec_rows, ignore_index=True)
+            except Exception as e:
+                print("⚠️ مقایسه‌ی سقف اجرا ناموفق بود:", str(e))
+
+        # --- مقایسه‌ی محدودیت‌های ضرر (سپر ایمنی) روی همان حساب مشترک ---
+        ll_out = None
+        if COMPARE_LOSSLIMIT_MODES:
+            try:
+                ll_rows = []
+                for label, (ld, lw) in LOSSLIMIT_MODES.items():
+                    pr = portfolio_replay(trades_df, symbols=(PORTFOLIO_SYMBOLS or None),
+                                          max_losses_day=ld, max_losses_week=lw)
+                    if pr is None:
+                        continue
+                    s = pr["stats"].copy()
+                    s.insert(0, "محدودیت", label)
+                    # بدترین ماه هر حالت هم برای قضاوت مهم است
+                    m = pr["monthly"]
+                    s["بدترین_ماه٪"] = round(float(m["بازده٪"].min()), 2) if not m.empty else 0.0
+                    s["ماه‌های_منفی"] = int((m["بازده٪"] < 0).sum()) if not m.empty else 0
+                    ll_rows.append(s)
+                if ll_rows:
+                    ll_out = pd.concat(ll_rows, ignore_index=True)
+            except Exception as e:
+                print("⚠️ مقایسه‌ی محدودیت ضرر ناموفق بود:", str(e))
+
+        if LIVE_MODE and live_book is not None:
+            # در حالت «عین لایو» همه‌ی نمادها روی یک حساب معامله می‌کنند، پس عدد هر
+            # نماد «بازده مستقل» نیست؛ سهم آن نماد از بازده حساب است (جمعشان = بازده کل).
+            # اسم ستون‌ها را صادقانه می‌کنیم تا کسی اشتباه نخواند.
+            summary_out = summary_out.rename(columns={
+                "بازده_خالص٪": "سهم_از_بازده_حساب٪",
+                "حداکثر_افت٪": "افت_سهم_این_نماد٪",
+            })
+
+        with pd.ExcelWriter(summary_path, engine="openpyxl") as sw:
+            summary_out.to_excel(sw, sheet_name="خلاصه", index=False)
+            if stab_out is not None:
+                stab_out.to_excel(sw, sheet_name="پایداری_نماد", index=False)
+            if loo_out is not None:
+                loo_out.to_excel(sw, sheet_name="حذف_تک‌نماد", index=False)
+            if cmp_out is not None:
+                cmp_out.to_excel(sw, sheet_name="مقایسه_نقطه_ورود", index=False)
+            if rr_out is not None:
+                rr_out.to_excel(sw, sheet_name="مقایسه_RR", index=False)
+            if mr_out is not None:
+                mr_out.to_excel(sw, sheet_name="مقایسه_حداقل_زون", index=False)
+            if dc_out is not None:
+                dc_out.to_excel(sw, sheet_name="مقایسه_لغو_دور", index=False)
+            if mg_out is not None:
+                mg_out.to_excel(sw, sheet_name="مقایسه_مدیریت", index=False)
+            if sl_out is not None:
+                sl_out.to_excel(sw, sheet_name="مقایسه_استاپ", index=False)
+            if q_out is not None:
+                q_out.to_excel(sw, sheet_name="مقایسه_کیفیت_زون", index=False)
+            if sw_out is not None:
+                sw_out.to_excel(sw, sheet_name="مقایسه_وزن_سشن", index=False)
+            if sess_out is not None:
+                sess_out.to_excel(sw, sheet_name="تحلیل_سشن", index=False)
+                hour_out.to_excel(sw, sheet_name="تحلیل_ساعت_خام", index=False)
+                sesssym_out.to_excel(sw, sheet_name="سشن_هر_نماد", index=False)
+                if SESSION_STABILITY:
+                    stab = session_stability(trades_df)
+                    if stab is not None:
+                        stab.to_excel(sw, sheet_name="پایداری_سشن", index=False)
+            if port is not None:
+                port["stats"].to_excel(sw, sheet_name="پرتفوی", index=False)
+                if WRITE_PORTFOLIO_DETAIL:
+                    port["yearly"].to_excel(sw, sheet_name="پرتفوی_سالانه", index=False)
+                    port["monthly"].to_excel(sw, sheet_name="پرتفوی_ماهانه", index=False)
+            if ec_out is not None:
+                ec_out.to_excel(sw, sheet_name="مقایسه_سقف_اجرا", index=False)
+            if ll_out is not None:
+                ll_out.to_excel(sw, sheet_name="مقایسه_محدودیت_ضرر", index=False)
+
+        # --- خروجی نهایی (جزئیات کامل) — فقط اگر WRITE_DETAILS روشن باشد ---
+        if WRITE_DETAILS:
+            with pd.ExcelWriter(detailed_path, engine="openpyxl") as writer:
+                overview_df.to_excel(writer, sheet_name="خلاصه_کلی", index=False)
+                sym_metrics.to_excel(writer, sheet_name="نتایج_اعدادی", index=False)
+                trades_by_symbol.to_excel(writer, sheet_name="معاملات_هر_نماد", index=False)
+                trades_by_year_symbol.to_excel(writer, sheet_name="معاملات_سال_نماد", index=False)
+                test_counts.to_excel(writer, sheet_name="تست1_تست2", index=False)
+                zone_stats.to_excel(writer, sheet_name="زون‌ها", index=False)
+                annual_df.to_excel(writer, sheet_name="بازده_سالانه", index=False)
+                monthly_df.to_excel(writer, sheet_name="بازده_ماهانه", index=False)
+                avg_df.to_excel(writer, sheet_name="میانگین_بازده", index=False)
+                reasons_out.to_excel(writer, sheet_name="دلایل", index=False)
+                for sheet_name, ddf in dist_sheets.items():
+                    safe_name = ("تحلیل_" + str(sheet_name))[:31]
+                    ddf.to_excel(writer, sheet_name=safe_name, index=False)
+            print("جزئیات_حرفه‌ای.xlsx ساخته شد ✅")
+    except Exception as e:
+        print("⚠️ ساخت جزئیات_حرفه‌ای.xlsx ناموفق بود:", str(e))
+
+    print("تمام شد ✅")
+    print("خلاصه_نتایج.xlsx ساخته شد ✅ |", summary_path)
+    print("جزئیات_حرفه‌ای.xlsx ساخته شد ✅ |", detailed_path)
+    print("مسیر خروجی:", outdir)
+
+if __name__ == "__main__":
+    main()
